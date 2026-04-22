@@ -359,11 +359,15 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	if err != nil {
 		tb.Fatal("failed to open log fifo:", err)
 	}
+	// Silence shim logs for benchmarks — they'd otherwise truncate
+	// the benchmark result output lines. Tests still get the logs for
+	// easier debugging.
+	_, isBench := tb.(*testing.B)
 	go func() {
 		buf := make([]byte, 32768)
 		for {
 			n, err := logFifo.Read(buf)
-			if n > 0 {
+			if n > 0 && !isBench {
 				tb.Logf("shim log: %s", string(buf[:n]))
 			}
 			if err != nil {

@@ -29,6 +29,7 @@ import (
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -164,19 +165,24 @@ func testShimUDSRoundTrip(t *testing.T) {
 	t.Log("UDS round trip test passed")
 }
 
-// BenchmarkShimUDSRoundTrip measures write/read round-trip latency over
-// a UDS-forwarded socket at different payload sizes. The host test acts
-// as the server; the container runs nc which echoes data back over the
-// forwarded socket.
+// benchmarkShimUDSRoundTrip measures one-way throughput across a
+// UDS-forwarded socket in both directions at different payload sizes.
+// The container runs `nc -U` which pipes socket↔stdio, giving us two
+// independent data paths to time:
+//
+//   - HostToContainer: host writes to hostConn, container's nc reads
+//     from the socket and writes to stdout. Host reads from the exec
+//     stdout FIFO.
+//   - ContainerToHost: host writes to the exec stdin FIFO, container's
+//     nc reads from stdin and writes to the socket. Host reads from
+//     hostConn.
 func benchmarkShimUDSRoundTrip(b *testing.B) {
 	skipFeatureBench(b, "uds")
 
 	shimBin, bundleDir, rootfsMounts := shimSetup(b)
-
-	containerID := containerID(b)
+	cid := containerID(b)
 	ns := shimtestNamespace
 
-	// Host-side UDS listener.
 	hostSockDir := b.TempDir()
 	hostSockPath := filepath.Join(hostSockDir, "bench.sock")
 	ln, err := net.Listen("unix", hostSockPath)
@@ -198,7 +204,7 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	stdoutPath, stderrPath := createIOFifos(b, bundleDir)
 	ctx := namespaces.WithNamespace(b.Context(), ns)
 
-	params := startShim(b, shimBin, bundleDir, containerID, ns)
+	params := startShim(b, shimBin, bundleDir, cid, ns)
 	conn := connectShim(b, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -208,19 +214,32 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	drainFifo(b, ctx, stdoutPath)
 	drainFifo(b, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, newCreateTaskRequest(b, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(b, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		b.Fatal("create failed:", err)
 	}
-	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		b.Fatal("start failed:", err)
 	}
 
-	// Exec nc -U inside the container.
+	// Set up exec with stdin/stdout/stderr FIFOs we control directly.
 	execID := "uds-bench"
 	execDir := b.TempDir()
-	_, execStdout, execStderr := createStdioFifos(b, execDir)
+	execStdin, execStdout, execStderr := createStdioFifos(b, execDir)
 
-	drainFifo(b, ctx, execStdout)
+	// Open stdin write-end and stdout read-end before Exec so the
+	// shim can open its ends without blocking.
+	stdinFifo, err := fifo.OpenFifo(ctx, execStdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		b.Fatal("open stdin fifo:", err)
+	}
+	defer stdinFifo.Close()
+
+	stdoutFifo, err := fifo.OpenFifo(ctx, execStdout, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		b.Fatal("open stdout fifo:", err)
+	}
+	defer stdoutFifo.Close()
+
 	drainFifo(b, ctx, execStderr)
 
 	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
@@ -232,16 +251,16 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	}
 
 	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
-		ID:     containerID,
+		ID:     cid,
 		ExecID: execID,
 		Spec:   procSpec,
+		Stdin:  execStdin,
 		Stdout: execStdout,
 		Stderr: execStderr,
 	}); err != nil {
 		b.Fatal("exec failed:", err)
 	}
-
-	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid, ExecID: execID}); err != nil {
 		b.Fatal("exec start failed:", err)
 	}
 
@@ -253,16 +272,6 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	}
 	defer hostConn.Close()
 
-	// Warm up: verify the socket is working before benchmarking.
-	warmup := []byte("warmup\n")
-	if _, err := hostConn.Write(warmup); err != nil {
-		b.Fatal("warmup write:", err)
-	}
-	warmupBuf := make([]byte, len(warmup))
-	if _, err := io.ReadFull(hostConn, warmupBuf); err != nil {
-		b.Fatal("warmup read:", err)
-	}
-
 	sizes := []struct {
 		name string
 		size int
@@ -272,39 +281,67 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 		{"4MB", 4 * 1024 * 1024},
 	}
 
-	for _, sz := range sizes {
-		b.Run(sz.name, func(b *testing.B) {
-			payload := make([]byte, sz.size)
-			rand.Read(payload)
-			recvBuf := make([]byte, sz.size)
+	// HostToContainer: write to hostConn, read from exec stdout FIFO.
+	b.Run("HostToContainer", func(b *testing.B) {
+		for _, sz := range sizes {
+			b.Run(sz.name, func(b *testing.B) {
+				payload := make([]byte, sz.size)
+				rand.Read(payload)
+				recvBuf := make([]byte, sz.size)
 
-			b.SetBytes(int64(sz.size))
-			b.ResetTimer()
+				b.SetBytes(int64(sz.size))
+				b.ResetTimer()
 
-			for i := 0; i < b.N; i++ {
-				// Write and read concurrently to avoid deadlock
-				// when the payload exceeds the socket buffer size.
-				errCh := make(chan error, 1)
-				go func() {
-					_, err := hostConn.Write(payload)
-					errCh <- err
-				}()
-				if _, err := io.ReadFull(hostConn, recvBuf); err != nil {
-					b.Fatal("read:", err)
+				for i := 0; i < b.N; i++ {
+					errCh := make(chan error, 1)
+					go func() {
+						_, err := hostConn.Write(payload)
+						errCh <- err
+					}()
+					if _, err := io.ReadFull(stdoutFifo, recvBuf); err != nil {
+						b.Fatal("read stdout:", err)
+					}
+					if err := <-errCh; err != nil {
+						b.Fatal("write hostConn:", err)
+					}
 				}
-				if err := <-errCh; err != nil {
-					b.Fatal("write:", err)
+			})
+		}
+	})
+
+	// ContainerToHost: write to exec stdin FIFO, read from hostConn.
+	b.Run("ContainerToHost", func(b *testing.B) {
+		for _, sz := range sizes {
+			b.Run(sz.name, func(b *testing.B) {
+				payload := make([]byte, sz.size)
+				rand.Read(payload)
+				recvBuf := make([]byte, sz.size)
+
+				b.SetBytes(int64(sz.size))
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					errCh := make(chan error, 1)
+					go func() {
+						_, err := stdinFifo.Write(payload)
+						errCh <- err
+					}()
+					if _, err := io.ReadFull(hostConn, recvBuf); err != nil {
+						b.Fatal("read hostConn:", err)
+					}
+					if err := <-errCh; err != nil {
+						b.Fatal("write stdin:", err)
+					}
 				}
-			}
+			})
+		}
+	})
 
-			b.StopTimer()
-		})
-	}
-
+	stdinFifo.Close()
 	hostConn.Close()
-	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
-	tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
-	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID})
-	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
-	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid, ExecID: execID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
 }
