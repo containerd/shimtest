@@ -47,5 +47,5 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build"
-	@echo "  sudo _output/shimtest.test -test.v -test.timeout=120s -shimtest.config=profiles/runc.json"
-	@echo "  sudo _output/shimtest.test -test.run=^$$ -test.bench=BenchmarkShim -test.count=3 -test.timeout=300s -shimtest.config=profiles/nerdbox.json"
+	@echo "  sudo _output/shimtest.test -test.v -test.timeout=120s -shimtest.config=profiles/myconfig.json"
+	@echo "  sudo _output/shimtest.test -test.run=^$$ -test.bench=BenchmarkShim -test.count=3 -test.timeout=300s -shimtest.config=profiles/myconfig.json"
