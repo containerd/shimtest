@@ -38,6 +38,7 @@ func TestShim(t *testing.T) {
 			t.Run("ExitCodes", testShimExitCodes)
 			t.Run("InitExitCodes", testShimInitExitCodes)
 			t.Run("OutputThenExit", testShimOutputThenExit)
+			t.Run("Events", testShimEvents)
 			t.Run("OOM", testShimOOM)
 			t.Run("TransferCopyTo", testTransferCopyTo)
 			t.Run("TransferCopyToAndFrom", testTransferCopyToAndFrom)

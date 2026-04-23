@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/api/events"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -520,6 +521,108 @@ func testShimClock(t *testing.T) {
 	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
 
 	t.Log("clock test passed")
+}
+
+// testShimEvents verifies that the shim publishes the expected task
+// lifecycle events (create, start, exit, delete) to its containerd
+// events endpoint during a normal run.
+func testShimEvents(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+	containerID := containerID(t)
+	ns := shimtestNamespace
+
+	createOCISpec(t, bundleDir, []string{"/bin/exit", "0"})
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	rec := startEventsRecorder(t, bundleDir)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	if _, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID}); err != nil {
+		t.Fatal("wait failed:", err)
+	}
+
+	// Wait returns when the init process is reaped, but the shim's
+	// TaskExit publish happens asynchronously from handleInitExit.
+	// Poll for the exit event to land before calling Delete so the
+	// exit/delete event ordering is deterministic.
+	if rec.waitForTopic("/tasks/exit", 2*time.Second) == nil {
+		t.Fatalf("exit event not published after task wait; received topics: %v", rec.topics())
+	}
+
+	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID}); err != nil {
+		t.Fatal("delete failed:", err)
+	}
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	// Required topics, in the order they must first appear.
+	want := []string{
+		"/tasks/create",
+		"/tasks/start",
+		"/tasks/exit",
+		"/tasks/delete",
+	}
+
+	for _, topic := range want {
+		if env := rec.waitForTopic(topic, 2*time.Second); env == nil {
+			t.Fatalf("missing event %q; received topics: %v", topic, rec.topics())
+		}
+	}
+
+	// Verify the ordering matches expectations (each required topic
+	// appears, and in the order listed above — extra events in between
+	// are allowed).
+	got := rec.topics()
+	t.Log("received topics:", got)
+	idx := 0
+	for _, topic := range got {
+		if idx < len(want) && topic == want[idx] {
+			idx++
+		}
+	}
+	if idx != len(want) {
+		t.Fatalf("events out of order or missing: want (in order) %v, got %v", want, got)
+	}
+
+	// Verify envelope fields on the exit event: correct namespace,
+	// correct container ID, exit status 0.
+	exitEnv := rec.waitForTopic("/tasks/exit", 0)
+	if exitEnv == nil {
+		t.Fatal("exit envelope vanished")
+	}
+	if exitEnv.Namespace != ns {
+		t.Errorf("exit envelope namespace: got %q, want %q", exitEnv.Namespace, ns)
+	}
+	var exitEvt events.TaskExit
+	if err := typeurl.UnmarshalTo(exitEnv.Event, &exitEvt); err != nil {
+		t.Fatal("unmarshal TaskExit:", err)
+	}
+	if exitEvt.ContainerID != containerID {
+		t.Errorf("exit event container id: got %q, want %q", exitEvt.ContainerID, containerID)
+	}
+	if exitEvt.ExitStatus != 0 {
+		t.Errorf("exit event exit status: got %d, want 0", exitEvt.ExitStatus)
+	}
+
+	t.Log("events test passed")
 }
 
 // testShimOOM runs a memory-hungry process inside a container with a

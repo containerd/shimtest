@@ -200,6 +200,12 @@ func shimSetup(tb testing.TB) (shimBin, bundleDir string, rootfsMounts []*types.
 	return shimBin, bundleDir, rootfsMounts
 }
 
+// containerdSockPath is the unix socket path inside a bundle that the
+// shim dials as its containerd events endpoint.
+func containerdSockPath(bundleDir string) string {
+	return filepath.Join(bundleDir, "c.sock")
+}
+
 // createIOFifos creates stdout and stderr FIFOs in the given directory.
 func createIOFifos(tb testing.TB, dir string) (stdoutPath, stderrPath string) {
 	tb.Helper()
@@ -402,7 +408,7 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	}()
 	tb.Cleanup(func() { logFifo.Close() })
 
-	containerdAddr := filepath.Join(bundleDir, "c.sock")
+	containerdAddr := containerdSockPath(bundleDir)
 
 	// Build bootstrap params to send on stdin (new protocol).
 	bootParams := &bootapi.BootstrapParams{
@@ -435,6 +441,11 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	cmd.Env = append(os.Environ(),
 		"GOMAXPROCS=2",
 		"SHIM_SOCKET_DIR="+socketDir,
+		// TTRPC_ADDRESS is where the shim forwards events. When a test
+		// has bound an eventRecorder to this path it will receive them;
+		// otherwise the publish calls fail with ENOENT and are logged
+		// but not fatal.
+		"TTRPC_ADDRESS="+containerdAddr,
 	)
 
 	var stdout, stderr bytes.Buffer

@@ -96,6 +96,7 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `ExitCodes` | exec | Exec processes that exit with a range of status codes and verify propagation |
 | `InitExitCodes` | — | Run the container's init process with `/bin/exit N` and verify task-level exit status propagation |
 | `OutputThenExit` | — | Run a process that prints 50 lines over 50ms then exits non-zero; verify both exit status and every line of output |
+| `Events` | — | Bind a TTRPC events recorder at `TTRPC_ADDRESS` and verify the shim publishes `create`, `start`, `exit`, `delete` events with correct fields |
 | `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |
 | `TransferCopyTo` | transfer | Copy a file into a container |
 | `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
@@ -109,7 +110,6 @@ Candidates to add later, ranked roughly by value:
 - **Signals** — send SIGTERM (not SIGKILL) to init, verify exit 143. Most shims get KILL right but botch non-KILL forwarding.
 - **Pause/Resume** — pause a ticker process, verify output stops; resume, verify it continues.
 - **Stats** — call `tc.Stats()` and assert cgroup counters populate (probe since not all shims implement it).
-- **Events** — verify Create/Start/Exit (and OOM) events fire with the expected fields. The shim is a publisher, not a server: it dials `ContainerdGrpcAddress` and calls `containerd.services.events.v1.Events.Forward`/`.Publish`, so this requires a receiver-side harness — a small TTRPC server implementing `Events.Forward` bound to that socket before `startShim`.
 - **Missing executable** — set `Args` to a nonexistent path and verify a clean error (not a hang or panic).
 - **Double-kill / post-exit API** — Kill after exit; Wait/State after Delete. Idempotency.
 - **Zombie reaping** — init that forks and exits; verify the shim's pid 1 reaps the orphan.
