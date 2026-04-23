@@ -1,5 +1,5 @@
 {
   "shim_binary": "containerd-shim-runc-v2",
   "uid": 1000,
-  "skip": ["transfer", "uds"]
+  "skip": ["oom", "transfer", "uds"]
 }

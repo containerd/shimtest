@@ -38,7 +38,7 @@ Tests are driven by one or more JSON configuration files. See
 | `uid` | int | UID to run as; defaults to the current user's UID. If set to a value different from the current UID and the effective UID is 0, the harness re-execs itself as that user via `sudo` |
 | `gid` | int | GID to run as |
 | `format_mounts` | bool | Provide the rootfs as formatted erofs/ext4 images with a `format/mkdir/overlay` descriptor for the shim to mount. Default (`false`) extracts the rootfs and provides a pre-mounted overlay (or plain directory when rootless) |
-| `skip` | []string | Feature names to skip (`exec`, `transfer`, `uds`) |
+| `skip` | []string | Feature names to skip (`exec`, `oom`, `transfer`, `uds`) |
 | `env` | map | Additional environment variables for the test run |
 | `debug` | bool | Enable debug logging on the shim |
 
@@ -93,6 +93,10 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `Exec` | exec | Exec a process inside a running container |
 | `StdioRoundTrip` | exec | Write to stdin, read from stdout via exec |
 | `Clock` | exec | Verify VM clock is synchronized with host |
+| `ExitCodes` | exec | Exec processes that exit with a range of status codes and verify propagation |
+| `InitExitCodes` | — | Run the container's init process with `/bin/exit N` and verify task-level exit status propagation |
+| `OutputThenExit` | — | Run a process that prints 50 lines over 50ms then exits non-zero; verify both exit status and every line of output |
+| `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |
 | `TransferCopyTo` | transfer | Copy a file into a container |
 | `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
 | `TransferExecVerify` | transfer | Copy a file in, verify via exec |

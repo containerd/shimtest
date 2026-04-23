@@ -59,11 +59,11 @@ func testShimUDSRoundTrip(t *testing.T) {
 
 	// Build OCI spec with UDS mount.
 	createOCISpec(t, bundleDir, []string{"/bin/forever"},
-		specs.Mount{
+		withExtraMounts(specs.Mount{
 			Type:        "uds",
 			Source:      hostSockPath,
 			Destination: containerSockPath,
-		},
+		}),
 	)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
@@ -194,11 +194,11 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	const containerSockPath = "/run/bench.sock"
 
 	createOCISpec(b, bundleDir, []string{"/bin/forever"},
-		specs.Mount{
+		withExtraMounts(specs.Mount{
 			Type:        "uds",
 			Source:      hostSockPath,
 			Destination: containerSockPath,
-		},
+		}),
 	)
 
 	stdoutPath, stderrPath := createIOFifos(b, bundleDir)

@@ -71,7 +71,8 @@ func randomSuffix() string {
 }
 
 // createOCISpec writes a minimal OCI spec config.json at the given path.
-func createOCISpec(tb testing.TB, bundleDir string, args []string, extraMounts ...specs.Mount) {
+// Each opt is applied to the spec in order before it is written.
+func createOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(*specs.Spec)) {
 	tb.Helper()
 
 	spec := specs.Spec{
@@ -123,7 +124,9 @@ func createOCISpec(tb testing.TB, bundleDir string, args []string, extraMounts .
 		}
 	}
 
-	spec.Mounts = append(spec.Mounts, extraMounts...)
+	for _, opt := range opts {
+		opt(&spec)
+	}
 
 	data, err := json.Marshal(spec)
 	if err != nil {
@@ -132,6 +135,28 @@ func createOCISpec(tb testing.TB, bundleDir string, args []string, extraMounts .
 
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), data, 0644); err != nil {
 		tb.Fatal("failed to write config.json:", err)
+	}
+}
+
+// withExtraMounts appends the given mounts to the OCI spec.
+func withExtraMounts(mounts ...specs.Mount) func(*specs.Spec) {
+	return func(s *specs.Spec) {
+		s.Mounts = append(s.Mounts, mounts...)
+	}
+}
+
+// withMemoryLimit sets the memory limit (in bytes) on the OCI spec,
+// with swap set equal to the limit so the container cannot grow via
+// swap before the OOM killer fires.
+func withMemoryLimit(bytes int64) func(*specs.Spec) {
+	return func(s *specs.Spec) {
+		if s.Linux.Resources == nil {
+			s.Linux.Resources = &specs.LinuxResources{}
+		}
+		s.Linux.Resources.Memory = &specs.LinuxMemory{
+			Limit: &bytes,
+			Swap:  &bytes,
+		}
 	}
 }
 

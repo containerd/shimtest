@@ -3,7 +3,7 @@
 // test suite, invoked either directly (testbin <cmd> [args...]) or
 // via symlink (e.g. /bin/cat -> /bin/testbin).
 //
-// Commands: forever, cat, date, echo, nc
+// Commands: forever, cat, date, echo, exit, memhog, nc, tickexit
 package main
 
 import (
@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,8 +45,14 @@ func main() {
 		cmdDate(args)
 	case "echo":
 		cmdEcho(args)
+	case "exit":
+		cmdExit(args)
+	case "memhog":
+		cmdMemhog(args)
 	case "nc":
 		cmdNC(args)
+	case "tickexit":
+		cmdTickexit(args)
 	default:
 		fmt.Fprintf(os.Stderr, "testbin: unknown command: %s\n", cmd)
 		os.Exit(127)
@@ -110,6 +117,47 @@ func cmdDate(args []string) {
 		fmt.Fprintf(os.Stderr, "date: unsupported format: %s\n", format)
 		os.Exit(1)
 	}
+}
+
+// cmdExit parses its first argument as an integer status and exits
+// with it. Exits 0 if no argument is supplied.
+func cmdExit(args []string) {
+	if len(args) < 2 {
+		os.Exit(0)
+	}
+	code, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "exit: invalid status %q: %v\n", args[1], err)
+		os.Exit(2)
+	}
+	os.Exit(code)
+}
+
+// cmdMemhog allocates memory 1MiB at a time, touching every page to
+// force commit, until the kernel OOM-kills the process. Used to drive
+// a memory-limited container to its limit.
+func cmdMemhog(_ []string) {
+	pageSize := os.Getpagesize()
+	const chunkSize = 1 << 20 // 1 MiB
+	var keep [][]byte
+	for {
+		b := make([]byte, chunkSize)
+		for i := 0; i < chunkSize; i += pageSize {
+			b[i] = 0xff
+		}
+		keep = append(keep, b)
+	}
+}
+
+// cmdTickexit writes "tick N\n" for N=1..50 with a 1ms delay between
+// writes, then exits with status 7. Used to verify that output
+// produced up to the moment of exit is captured by the shim.
+func cmdTickexit(_ []string) {
+	for i := 1; i <= 50; i++ {
+		fmt.Printf("tick %d\n", i)
+		time.Sleep(1 * time.Millisecond)
+	}
+	os.Exit(7)
 }
 
 // cmdNC connects to a unix domain socket and copies bidirectionally

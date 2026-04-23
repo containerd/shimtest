@@ -41,7 +41,7 @@ func openTestbin() (io.Reader, error) {
 
 // testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command.
-var testbinCommands = []string{"forever", "cat", "date", "echo", "nc"}
+var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "memhog", "nc", "tickexit"}
 
 // writeRootfsErofs builds an erofs image containing the testbin rootfs
 // directly from the embedded binary, without touching the local

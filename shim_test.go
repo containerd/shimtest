@@ -521,3 +521,269 @@ func testShimClock(t *testing.T) {
 
 	t.Log("clock test passed")
 }
+
+// testShimOOM runs a memory-hungry process inside a container with a
+// 128MiB memory limit and verifies the kernel OOM-kills it (exit 137).
+func testShimOOM(t *testing.T) {
+	skipFeature(t, "oom")
+	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+	containerID := containerID(t)
+	ns := shimtestNamespace
+
+	createOCISpec(t, bundleDir, []string{"/bin/memhog"},
+		withMemoryLimit(128*1024*1024),
+	)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	if err != nil {
+		t.Fatal("wait failed:", err)
+	}
+	t.Log("task exit status:", waitResp.ExitStatus)
+
+	// SIGKILL (9) from the kernel OOM killer is reported as 128+9=137.
+	const sigkillExit = 128 + uint32(syscall.SIGKILL)
+	if waitResp.ExitStatus != sigkillExit {
+		t.Fatalf("expected exit status %d (SIGKILL from OOM killer), got %d",
+			sigkillExit, waitResp.ExitStatus)
+	}
+
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	t.Log("oom test passed")
+}
+
+// testShimExitCodes runs /bin/exit N inside a container via exec for a
+// range of values and verifies each is propagated back on Wait.
+func testShimExitCodes(t *testing.T) {
+	skipFeature(t, "exec")
+	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+	containerID := containerID(t)
+	ns := shimtestNamespace
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"})
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	for i, code := range []int{0, 1, 2, 42, 127, 255} {
+		t.Run(fmt.Sprintf("Exit%d", code), func(t *testing.T) {
+			execID := fmt.Sprintf("exit-%d", i)
+			execStdout, execStderr := createIOFifos(t, t.TempDir())
+			drainFifo(t, ctx, execStdout)
+			drainFifo(t, ctx, execStderr)
+
+			procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+				Args: []string{"/bin/exit", strconv.Itoa(code)},
+				Cwd:  "/",
+				Env:  []string{"PATH=/bin:/usr/bin"},
+			})
+			if err != nil {
+				t.Fatal("marshal exec spec:", err)
+			}
+
+			if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+				ID:     containerID,
+				ExecID: execID,
+				Spec:   procSpec,
+				Stdout: execStdout,
+				Stderr: execStderr,
+			}); err != nil {
+				t.Fatal("exec failed:", err)
+			}
+			if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+				t.Fatal("exec start failed:", err)
+			}
+
+			waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID, ExecID: execID})
+			if err != nil {
+				t.Fatal("exec wait failed:", err)
+			}
+			if waitResp.ExitStatus != uint32(code) {
+				t.Fatalf("expected exit status %d, got %d", code, waitResp.ExitStatus)
+			}
+
+			if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
+				t.Fatal("exec delete failed:", err)
+			}
+		})
+	}
+
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	t.Log("exit codes test passed")
+}
+
+// testShimOutputThenExit runs a process that writes 50 lines over
+// ~50ms then exits non-zero, and verifies that both the exit status
+// and every line of output are captured by the shim.
+func testShimOutputThenExit(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+	containerID := containerID(t)
+	ns := shimtestNamespace
+
+	createOCISpec(t, bundleDir, []string{"/bin/tickexit"})
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	var stdoutBuf bytes.Buffer
+	var stdoutMu sync.Mutex
+	drainFifoInto(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	if err != nil {
+		t.Fatal("wait failed:", err)
+	}
+	t.Log("task exit status:", waitResp.ExitStatus)
+
+	const expectedExit = 7
+	if waitResp.ExitStatus != expectedExit {
+		t.Fatalf("expected exit status %d, got %d", expectedExit, waitResp.ExitStatus)
+	}
+
+	// The drainer goroutine may still be catching up after the task
+	// exited — poll until the final line appears (or time out).
+	deadline := time.After(5 * time.Second)
+	for {
+		stdoutMu.Lock()
+		got := stdoutBuf.String()
+		stdoutMu.Unlock()
+		if strings.Contains(got, "tick 50\n") {
+			break
+		}
+		select {
+		case <-deadline:
+			stdoutMu.Lock()
+			final := stdoutBuf.String()
+			stdoutMu.Unlock()
+			t.Fatalf("timed out waiting for final output, got: %q", final)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	stdoutMu.Lock()
+	got := stdoutBuf.String()
+	stdoutMu.Unlock()
+
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 50 {
+		t.Fatalf("expected 50 output lines, got %d: %q", len(lines), got)
+	}
+	for i, line := range lines {
+		want := fmt.Sprintf("tick %d", i+1)
+		if line != want {
+			t.Fatalf("line %d: got %q, want %q", i, line, want)
+		}
+	}
+
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	t.Log("output-then-exit test passed")
+}
+
+// testShimInitExitCodes runs /bin/exit N as the container's init
+// process for a range of values and verifies the exit status is
+// propagated back from the task (not an exec).
+func testShimInitExitCodes(t *testing.T) {
+	for _, code := range []int{0, 1, 2, 42, 127, 255} {
+		t.Run(fmt.Sprintf("Exit%d", code), func(t *testing.T) {
+			shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+			cid := containerID(t)
+			ns := shimtestNamespace
+
+			createOCISpec(t, bundleDir, []string{"/bin/exit", strconv.Itoa(code)})
+
+			stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+			ctx := namespaces.WithNamespace(t.Context(), ns)
+
+			params := startShim(t, shimBin, bundleDir, cid, ns)
+			conn := connectShim(t, params.Address)
+			client := ttrpc.NewClient(conn)
+			defer client.Close()
+
+			tc := taskAPI.NewTTRPCTaskClient(client)
+
+			drainFifo(t, ctx, stdoutPath)
+			drainFifo(t, ctx, stderrPath)
+
+			if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+				t.Fatal("create failed:", err)
+			}
+			if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
+				t.Fatal("start failed:", err)
+			}
+
+			waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
+			if err != nil {
+				t.Fatal("wait failed:", err)
+			}
+			if waitResp.ExitStatus != uint32(code) {
+				t.Fatalf("expected exit status %d, got %d", code, waitResp.ExitStatus)
+			}
+
+			tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
+			tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
+		})
+	}
+}
