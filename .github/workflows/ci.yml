@@ -57,6 +57,12 @@ jobs:
       - name: Build shimtest
         run: make build
 
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+        # by default, which breaks rootless runc.
+        # https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890#unprivileged-user-namespace-restrictions-15
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Prepare rootless profile
         # runc-rootless.json pins uid: 1000, but the GitHub Actions
         # runner user may have a different uid. Rewrite the profile to
