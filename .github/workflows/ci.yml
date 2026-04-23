@@ -36,9 +36,9 @@ jobs:
 
       - name: Install runc
         run: |
-          git clone --depth=50 https://github.com/opencontainers/runc.git /tmp/runc
+          git clone --depth=1 --branch "${RUNC_VERSION}" \
+            https://github.com/opencontainers/runc.git /tmp/runc
           cd /tmp/runc
-          git checkout "${RUNC_VERSION}"
           make BUILDTAGS='seccomp'
           sudo make install
           runc --version
