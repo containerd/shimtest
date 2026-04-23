@@ -390,23 +390,44 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	if err != nil {
 		tb.Fatal("failed to open log fifo:", err)
 	}
-	// Silence shim logs for benchmarks — they'd otherwise truncate
-	// the benchmark result output lines. Tests still get the logs for
-	// easier debugging.
+	// Buffer shim logs and only dump them on test failure. Benchmarks
+	// always discard — shim log lines would otherwise truncate the
+	// benchmark result output.
 	_, isBench := tb.(*testing.B)
+	var logBuf bytes.Buffer
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		buf := make([]byte, 32768)
 		for {
 			n, err := logFifo.Read(buf)
 			if n > 0 && !isBench {
-				tb.Logf("shim log: %s", string(buf[:n]))
+				logBuf.Write(buf[:n])
 			}
 			if err != nil {
 				return
 			}
 		}
 	}()
-	tb.Cleanup(func() { logFifo.Close() })
+	// Cleanup order (LIFO): dump runs first (below). It falls through
+	// to the Close/wait cleanup, which shuts the FIFO and blocks until
+	// the reader has finished appending — so the buffer is complete
+	// by the time we read it in the dump.
+	if !isBench {
+		tb.Cleanup(func() {
+			if !tb.Failed() {
+				return
+			}
+			if logBuf.Len() == 0 {
+				return
+			}
+			tb.Logf("shim logs:\n%s", logBuf.String())
+		})
+	}
+	tb.Cleanup(func() {
+		logFifo.Close()
+		<-done
+	})
 
 	containerdAddr := containerdSockPath(bundleDir)
 
