@@ -102,6 +102,18 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `TransferExecVerify` | transfer | Copy a file in, verify via exec |
 | `UDSRoundTrip` | uds | UDS socket forwarding round-trip |
 
+### Planned tests
+
+Candidates to add later, ranked roughly by value:
+
+- **Signals** — send SIGTERM (not SIGKILL) to init, verify exit 143. Most shims get KILL right but botch non-KILL forwarding.
+- **Pause/Resume** — pause a ticker process, verify output stops; resume, verify it continues.
+- **Stats** — call `tc.Stats()` and assert cgroup counters populate (probe since not all shims implement it).
+- **Events** — verify Create/Start/Exit (and OOM) events fire with the expected fields. The shim is a publisher, not a server: it dials `ContainerdGrpcAddress` and calls `containerd.services.events.v1.Events.Forward`/`.Publish`, so this requires a receiver-side harness — a small TTRPC server implementing `Events.Forward` bound to that socket before `startShim`.
+- **Missing executable** — set `Args` to a nonexistent path and verify a clean error (not a hang or panic).
+- **Double-kill / post-exit API** — Kill after exit; Wait/State after Delete. Idempotency.
+- **Zombie reaping** — init that forks and exits; verify the shim's pid 1 reaps the orphan.
+
 ## Benchmarks
 
 Benchmarks live under `BenchmarkShim/<config-name>/<bench-name>`.
