@@ -8,17 +8,18 @@ on:
 permissions:
   contents: read
 
-env:
-  RUNC_VERSION: v1.4.1
-  # Matches the github.com/containerd/containerd/v2 pseudo-version
-  # in go.mod (via the dmcgowan fork replace directive).
-  CONTAINERD_REF: v2.3.0-beta.dmcg.5
-
 jobs:
   test-runc-shim:
-    name: Test runc shim
+    name: Test containerd runc shim (${{ matrix.containerd }})
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        containerd:
+          - release/2.2
+          - v2.3.0-beta.2
+          - main
 
     steps:
       - name: Checkout
@@ -34,25 +35,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
 
-      - name: Install runc
+      - name: Build containerd shim
+        # The shimtest harness does not require a containerd daemon;
+        # only the shim binary is needed.
         run: |
-          git clone --depth=1 --branch "${RUNC_VERSION}" \
+          git clone --depth=1 --branch "${{ matrix.containerd }}" \
+            https://github.com/containerd/containerd.git /tmp/containerd
+          cd /tmp/containerd
+          make bin/containerd-shim-runc-v2
+          sudo install -m 0755 bin/containerd-shim-runc-v2 /usr/local/bin/
+          which containerd-shim-runc-v2
+
+      - name: Install runc
+        # Use the runc version pinned by the containerd revision under test.
+        run: |
+          runc_version=$(cat /tmp/containerd/script/setup/runc-version)
+          echo "runc version: ${runc_version}"
+          git clone --depth=1 --branch "${runc_version}" \
             https://github.com/opencontainers/runc.git /tmp/runc
           cd /tmp/runc
           make BUILDTAGS='seccomp'
           sudo make install
           runc --version
-
-      - name: Build containerd shim
-        # The shimtest harness does not require a containerd daemon;
-        # only the shim binary is needed.
-        run: |
-          git clone https://github.com/dmcgowan/containerd.git /tmp/containerd
-          cd /tmp/containerd
-          git checkout "${CONTAINERD_REF}"
-          make bin/containerd-shim-runc-v2
-          sudo install -m 0755 bin/containerd-shim-runc-v2 /usr/local/bin/
-          which containerd-shim-runc-v2
 
       - name: Build shimtest
         run: make build
