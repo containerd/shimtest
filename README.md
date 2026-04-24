@@ -97,6 +97,8 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `InitExitCodes` | — | Run the container's init process with `/bin/exit N` and verify task-level exit status propagation |
 | `OutputThenExit` | — | Run a process that prints 50 lines over 50ms then exits non-zero; verify both exit status and every line of output |
 | `Events` | — | Bind a TTRPC events recorder at `TTRPC_ADDRESS` and verify the shim publishes `create`, `start`, `exit`, `delete` events with correct fields |
+| `LargeFileRead` | exec | Read a 64 MiB fixture from a secondary read-only erofs layer, verify crc32-Castagnoli, report MiB/s |
+| `BindMountRead` | exec | Bind-mount the same 64 MiB fixture from a host tempfile and verify+benchmark via the bind path |
 | `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |
 | `TransferCopyTo` | transfer | Copy a file into a container |
 | `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
@@ -111,6 +113,7 @@ Candidates to add later, ranked roughly by value:
 - **Pause/Resume** — pause a ticker process, verify output stops; resume, verify it continues.
 - **Stats** — call `tc.Stats()` and assert cgroup counters populate (probe since not all shims implement it).
 - **Missing executable** — set `Args` to a nonexistent path and verify a clean error (not a hang or panic).
+- **Cold-cache IO** — `LargeFileRead`/`BindMountRead` currently measure warm-cache throughput. A cold-cache variant would need to drop caches between runs (root only) or grow the fixture beyond cache size.
 - **Double-kill / post-exit API** — Kill after exit; Wait/State after Delete. Idempotency.
 - **Zombie reaping** — init that forks and exits; verify the shim's pid 1 reaps the orphan.
 

@@ -20,10 +20,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	_ "embed"
+	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/api/types"
@@ -41,7 +46,116 @@ func openTestbin() (io.Reader, error) {
 
 // testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command.
-var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "memhog", "nc", "tickexit"}
+var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "hashverify", "memhog", "nc", "tickexit"}
+
+// bigFileSize is the size of the IO benchmark fixture file. Large
+// enough to swamp small per-call overheads while still building/
+// extracting in well under a second on host storage.
+const bigFileSize = 64 << 20 // 64 MiB
+
+// bigFileContainerPath is where the IO fixture file is mounted inside
+// the container, both via the dedicated erofs layer and via host bind
+// mount (in different tests).
+const bigFileContainerPath = "/data/bigfile"
+
+// bigFileSeed is the ChaCha8 seed used to generate the fixture
+// payload. Any change here invalidates the cached hash.
+var bigFileSeed = [32]byte{
+	's', 'h', 'i', 'm', 't', 'e', 's', 't',
+	'b', 'i', 'g', 'f', 'i', 'l', 'e', 'v', '1',
+}
+
+// bigFileReader streams deterministic ChaCha8-seeded bytes up to
+// bigFileSize and computes the crc32-Castagnoli of what it produced.
+// The hash is available via HashHex once Read has returned io.EOF.
+//
+// Memory cost is O(1) — callers io.Copy it into the destination
+// (erofs entry, host tempfile, etc.) without materializing the
+// 64 MiB payload.
+type bigFileReader struct {
+	src    *rand.ChaCha8
+	crc    hash.Hash32
+	remain int
+}
+
+func newBigFileReader() *bigFileReader {
+	return &bigFileReader{
+		src:    rand.NewChaCha8(bigFileSeed),
+		crc:    crc32.New(crc32.MakeTable(crc32.Castagnoli)),
+		remain: bigFileSize,
+	}
+}
+
+func (r *bigFileReader) Read(p []byte) (int, error) {
+	if r.remain == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.remain {
+		n = r.remain
+	}
+	nr, _ := r.src.Read(p[:n]) // ChaCha8.Read always fills the buffer
+	r.crc.Write(p[:nr])
+	r.remain -= nr
+	return nr, nil
+}
+
+// HashHex returns the crc32-Castagnoli (hex) of the bytes produced so
+// far. Call after the reader is fully consumed to get the fixture's
+// canonical hash.
+func (r *bigFileReader) HashHex() string {
+	return fmt.Sprintf("%08x", r.crc.Sum32())
+}
+
+// bigFileHashHex returns the canonical crc32-Castagnoli of the
+// fixture by streaming through io.Discard. ~10ms; only called a
+// couple of times per test run.
+func bigFileHashHex() string {
+	r := newBigFileReader()
+	_, _ = io.Copy(io.Discard, r)
+	return r.HashHex()
+}
+
+// writeBigFileErofs builds a separate erofs image containing only the
+// IO benchmark fixture mounted at /data/bigfile. Returns the image
+// path; callers compose it as an additional lower in the rootfs
+// overlay.
+func writeBigFileErofs(tb testing.TB) string {
+	tb.Helper()
+
+	imgPath := filepath.Join(tb.TempDir(), "bigfile.erofs")
+	f, err := os.Create(imgPath)
+	if err != nil {
+		tb.Fatal("create bigfile erofs:", err)
+	}
+	defer f.Close()
+
+	w := erofs.Create(f)
+
+	if err := w.Mkdir("data", 0755); err != nil {
+		tb.Fatal("mkdir data:", err)
+	}
+
+	bf, err := w.Create("data/bigfile")
+	if err != nil {
+		tb.Fatal("create bigfile entry:", err)
+	}
+	if _, err := io.Copy(bf, newBigFileReader()); err != nil {
+		tb.Fatal("write bigfile:", err)
+	}
+	if err := bf.Chmod(0644); err != nil {
+		tb.Fatal("chmod bigfile:", err)
+	}
+	if err := bf.Close(); err != nil {
+		tb.Fatal("close bigfile:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		tb.Fatal("erofs close:", err)
+	}
+
+	return imgPath
+}
 
 // writeRootfsErofs builds an erofs image containing the testbin rootfs
 // directly from the embedded binary, without touching the local
@@ -212,19 +326,23 @@ func buildEmbeddedRootfs(tb testing.TB, bundleDir string) []*types.Mount {
 	tb.Helper()
 
 	erofsImg := writeRootfsErofs(tb)
+	bigImg := writeBigFileErofs(tb)
 
 	if testCfg.FormatMounts {
-		return buildErofsMounts(tb, erofsImg)
+		return buildErofsMounts(tb, []string{erofsImg, bigImg})
 	}
 
 	if os.Getuid() != 0 {
 		// Rootless: extract directly into the bundle's rootfs dir.
 		// No mounts needed — crun uses Root.Path directly.
-		extractErofsIntoDir(tb, erofsImg, filepath.Join(bundleDir, "rootfs"))
+		rootfs := filepath.Join(bundleDir, "rootfs")
+		extractErofsIntoDir(tb, erofsImg, rootfs)
+		extractErofsIntoDir(tb, bigImg, rootfs)
 		return nil
 	}
 
 	srcDir := extractErofsToDir(tb, erofsImg)
+	extractErofsIntoDir(tb, bigImg, srcDir)
 	return buildOverlayMounts(tb, srcDir)
 }
 
@@ -255,9 +373,10 @@ func buildOverlayMounts(tb testing.TB, lower string) []*types.Mount {
 	}}
 }
 
-// buildErofsMounts builds the three-mount erofs layout: ext4 (rw) +
-// erofs (ro) + overlay, matching what the erofs snapshotter produces.
-func buildErofsMounts(tb testing.TB, erofsImg string) []*types.Mount {
+// buildErofsMounts builds the layered erofs layout: ext4 (rw scratch)
+// + one or more erofs lowers + overlay. Lowers are stacked in order,
+// with erofsImgs[0] highest (matching overlay's lowerdir semantics).
+func buildErofsMounts(tb testing.TB, erofsImgs []string) []*types.Mount {
 	tb.Helper()
 
 	ext4Img := filepath.Join(tb.TempDir(), "scratch.ext4")
@@ -265,27 +384,33 @@ func buildErofsMounts(tb testing.TB, erofsImg string) []*types.Mount {
 		tb.Fatal("create ext4:", err)
 	}
 
-	return []*types.Mount{
-		{
-			Type:    "ext4",
-			Source:  ext4Img,
-			Options: []string{"rw", "loop"},
-		},
-		{
+	mounts := []*types.Mount{{
+		Type:    "ext4",
+		Source:  ext4Img,
+		Options: []string{"rw", "loop"},
+	}}
+
+	lowers := make([]string, 0, len(erofsImgs))
+	for i, img := range erofsImgs {
+		mounts = append(mounts, &types.Mount{
 			Type:    "erofs",
-			Source:  erofsImg,
+			Source:  img,
 			Options: []string{"ro", "loop"},
-		},
-		{
-			Type:   "format/mkdir/overlay",
-			Source: "overlay",
-			Options: []string{
-				"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-				"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
-				"workdir={{ mount 0 }}/work",
-				"upperdir={{ mount 0 }}/upper",
-				"lowerdir={{ mount 1 }}",
-			},
-		},
+		})
+		lowers = append(lowers, fmt.Sprintf("{{ mount %d }}", i+1))
 	}
+
+	mounts = append(mounts, &types.Mount{
+		Type:   "format/mkdir/overlay",
+		Source: "overlay",
+		Options: []string{
+			"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+			"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
+			"workdir={{ mount 0 }}/work",
+			"upperdir={{ mount 0 }}/upper",
+			"lowerdir=" + strings.Join(lowers, ":"),
+		},
+	})
+
+	return mounts
 }

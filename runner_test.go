@@ -39,6 +39,8 @@ func TestShim(t *testing.T) {
 			t.Run("InitExitCodes", testShimInitExitCodes)
 			t.Run("OutputThenExit", testShimOutputThenExit)
 			t.Run("Events", testShimEvents)
+			t.Run("LargeFileRead", testShimLargeFileRead)
+			t.Run("BindMountRead", testShimBindMountRead)
 			t.Run("OOM", testShimOOM)
 			t.Run("TransferCopyTo", testTransferCopyTo)
 			t.Run("TransferCopyToAndFrom", testTransferCopyToAndFrom)
@@ -65,6 +67,8 @@ func BenchmarkShim(b *testing.B) {
 			b.Run("Start", benchmarkShimStart)
 			b.Run("Exec", benchmarkShimExec)
 			b.Run("StdioRoundTrip", benchmarkShimStdioRoundTrip)
+			b.Run("ReadLargeFile", benchmarkShimReadLargeFile)
+			b.Run("ReadBindMount", benchmarkShimReadBindMount)
 			b.Run("UDSRoundTrip", benchmarkShimUDSRoundTrip)
 		})
 	}

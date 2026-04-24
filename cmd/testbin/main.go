@@ -3,11 +3,12 @@
 // test suite, invoked either directly (testbin <cmd> [args...]) or
 // via symlink (e.g. /bin/cat -> /bin/testbin).
 //
-// Commands: forever, cat, date, echo, exit, memhog, nc, tickexit
+// Commands: forever, cat, date, echo, exit, hashverify, memhog, nc, tickexit
 package main
 
 import (
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -47,6 +48,8 @@ func main() {
 		cmdEcho(args)
 	case "exit":
 		cmdExit(args)
+	case "hashverify":
+		cmdHashverify(args)
 	case "memhog":
 		cmdMemhog(args)
 	case "nc":
@@ -117,6 +120,97 @@ func cmdDate(args []string) {
 		fmt.Fprintf(os.Stderr, "date: unsupported format: %s\n", format)
 		os.Exit(1)
 	}
+}
+
+// cmdHashverify reads a file in 1 MiB chunks and verifies the data
+// against an expected crc32-Castagnoli (hex). Reads happen on the main
+// goroutine using a sync.Pool of buffers; chunks are handed to a
+// hashing consumer via a small buffered channel. A non-blocking send
+// is tried first and the count of blocking falls is reported, so the
+// caller can see when the hash consumer (rather than IO) is the
+// bottleneck. On success it prints
+//
+//	ok bytes=N ns=M cpu_bound=K
+//
+// to stdout. Hash mismatch or read errors exit non-zero.
+//
+// Usage: hashverify <file> <expected-hex>
+func cmdHashverify(args []string) {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: hashverify <file> <expected-hex>")
+		os.Exit(1)
+	}
+	path := args[1]
+	wantHex := args[2]
+
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hashverify: open %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	const bufSize = 1 << 20 // 1 MiB
+	pool := &sync.Pool{New: func() any {
+		b := make([]byte, bufSize)
+		return &b
+	}}
+	ch := make(chan *[]byte, 8)
+
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	var consumerWG sync.WaitGroup
+	consumerWG.Add(1)
+	go func() {
+		defer consumerWG.Done()
+		for buf := range ch {
+			h.Write(*buf)
+			full := (*buf)[:cap(*buf)]
+			pool.Put(&full)
+		}
+	}()
+
+	var (
+		total    int64
+		cpuBound int
+	)
+	start := time.Now()
+	for {
+		bp := pool.Get().(*[]byte)
+		full := (*bp)[:cap(*bp)]
+		n, rerr := f.Read(full)
+		if n > 0 {
+			chunk := full[:n]
+			cp := &chunk
+			select {
+			case ch <- cp:
+			default:
+				cpuBound++
+				ch <- cp
+			}
+			total += int64(n)
+		} else {
+			pool.Put(bp)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			close(ch)
+			fmt.Fprintf(os.Stderr, "hashverify: read %s: %v\n", path, rerr)
+			os.Exit(1)
+		}
+	}
+	elapsed := time.Since(start)
+	close(ch)
+	consumerWG.Wait()
+
+	gotHex := fmt.Sprintf("%08x", h.Sum32())
+	if gotHex != wantHex {
+		fmt.Fprintf(os.Stderr, "hashverify: hash mismatch for %s: got %s, want %s\n", path, gotHex, wantHex)
+		os.Exit(1)
+	}
+
+	fmt.Printf("ok bytes=%d ns=%d cpu_bound=%d\n", total, elapsed.Nanoseconds(), cpuBound)
 }
 
 // cmdExit parses its first argument as an integer status and exits

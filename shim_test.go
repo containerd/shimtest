@@ -19,6 +19,9 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -521,6 +524,144 @@ func testShimClock(t *testing.T) {
 	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
 
 	t.Log("clock test passed")
+}
+
+// testShimLargeFileRead reads /data/bigfile (a 64 MiB fixture from a
+// secondary read-only erofs layer) inside the container, verifies its
+// crc32-Castagnoli, and reports throughput.
+func testShimLargeFileRead(t *testing.T) {
+	skipFeature(t, "exec")
+	runHashverify(t, bigFileContainerPath, bigFileHashHex(), nil)
+}
+
+// testShimBindMountRead streams the same 64 MiB fixture into a host
+// tempfile, bind-mounts it into the container, and runs hashverify
+// against the bind path.
+func testShimBindMountRead(t *testing.T) {
+	skipFeature(t, "exec")
+
+	hostFile := filepath.Join(t.TempDir(), "bigfile")
+	f, err := os.Create(hostFile)
+	if err != nil {
+		t.Fatal("create host bigfile:", err)
+	}
+	if _, err := io.Copy(f, newBigFileReader()); err != nil {
+		f.Close()
+		t.Fatal("write host bigfile:", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal("close host bigfile:", err)
+	}
+
+	const containerPath = "/tmp/bigfile"
+	// Note: a separate "ro" option is not portable across rootless
+	// runc + older kernels (atomic bind+ro requires mount_setattr).
+	// The container is destroyed after the test, so writable is fine.
+	mount := specs.Mount{
+		Type:        "bind",
+		Source:      hostFile,
+		Destination: containerPath,
+		Options:     []string{"rbind"},
+	}
+	runHashverify(t, containerPath, bigFileHashHex(), []specs.Mount{mount})
+}
+
+// runHashverify shares the harness for the IO benchmark tests: spin
+// up a container with the given extra mounts, exec /bin/hashverify
+// against the path, parse "ok bytes=N ns=M cpu_bound=K" from stdout,
+// and report the resulting throughput via t.Log.
+func runHashverify(t *testing.T, path, hashHex string, extraMounts []specs.Mount) {
+	t.Helper()
+	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+
+	cid := containerID(t)
+	ns := shimtestNamespace
+
+	var opts []func(*specs.Spec)
+	if len(extraMounts) > 0 {
+		opts = append(opts, withExtraMounts(extraMounts...))
+	}
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, opts...)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, cid, ns)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "hashv"
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
+	var execBuf bytes.Buffer
+	var execMu sync.Mutex
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/hashverify", path, hashHex},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("marshal exec spec:", err)
+	}
+
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     cid,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdout: execStdout,
+		Stderr: execStderr,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid, ExecID: execID}); err != nil {
+		t.Fatal("exec start failed:", err)
+	}
+
+	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid, ExecID: execID})
+	if err != nil {
+		t.Fatal("exec wait failed:", err)
+	}
+	if waitResp.ExitStatus != 0 {
+		t.Fatalf("hashverify exit status %d", waitResp.ExitStatus)
+	}
+
+	// Allow the FIFO drainer goroutine to flush before reading.
+	time.Sleep(200 * time.Millisecond)
+
+	execMu.Lock()
+	out := strings.TrimSpace(execBuf.String())
+	execMu.Unlock()
+
+	var nBytes, elapsedNS, cpuBound int64
+	parsed, err := fmt.Sscanf(out, "ok bytes=%d ns=%d cpu_bound=%d", &nBytes, &elapsedNS, &cpuBound)
+	if err != nil || parsed != 3 {
+		t.Fatalf("could not parse hashverify output %q: %v (parsed %d)", out, err, parsed)
+	}
+
+	mibPerSec := float64(nBytes) / (float64(elapsedNS) / 1e9) / (1 << 20)
+	t.Logf("read %d bytes in %.2f ms = %.2f MiB/s (cpu_bound=%d)",
+		nBytes, float64(elapsedNS)/1e6, mibPerSec, cpuBound)
+
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid, ExecID: execID})
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
 }
 
 // testShimEvents verifies that the shim publishes the expected task

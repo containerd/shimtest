@@ -21,6 +21,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -467,6 +469,134 @@ func benchmarkShimStdioRoundTrip(b *testing.B) {
 	tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true})
 	tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid, ExecID: execID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
+}
+
+// benchmarkShimReadLargeFile measures the time to read + crc32 a
+// 64 MiB fixture from the secondary erofs layer. The container is
+// set up once; each iteration is one exec of /bin/hashverify with
+// fresh IO FIFOs. Warm-cache after the first iteration, so this is
+// really a measure of the shim's IO plumbing (virtio-blk / erofs /
+// page-cache indirection) under cache hit.
+func benchmarkShimReadLargeFile(b *testing.B) {
+	skipFeatureBench(b, "exec")
+	benchmarkShimHashverify(b, bigFileContainerPath, bigFileHashHex(), nil)
+}
+
+// benchmarkShimReadBindMount is the bind-mount counterpart of
+// benchmarkShimReadLargeFile: host tempfile → bind-mounted into the
+// container → same hashverify loop. For nerdbox this exercises the
+// virtiofs bind path; for runc it's a host kernel bind.
+func benchmarkShimReadBindMount(b *testing.B) {
+	skipFeatureBench(b, "exec")
+
+	hostFile := filepath.Join(b.TempDir(), "bigfile")
+	f, err := os.Create(hostFile)
+	if err != nil {
+		b.Fatal("create host bigfile:", err)
+	}
+	if _, err := io.Copy(f, newBigFileReader()); err != nil {
+		f.Close()
+		b.Fatal("write host bigfile:", err)
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal("close host bigfile:", err)
+	}
+
+	const containerPath = "/tmp/bigfile"
+	benchmarkShimHashverify(b, containerPath, bigFileHashHex(), []specs.Mount{{
+		Type:        "bind",
+		Source:      hostFile,
+		Destination: containerPath,
+		Options:     []string{"rbind"},
+	}})
+}
+
+// benchmarkShimHashverify is the shared driver for the two read
+// benchmarks. Only the exec+start+wait of hashverify is timed; the
+// per-iteration FIFO and exec-delete work is excluded via
+// StopTimer/StartTimer.
+func benchmarkShimHashverify(b *testing.B, path, hashHex string, extraMounts []specs.Mount) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(b)
+	cid := containerID(b)
+	ns := shimtestNamespace
+
+	var opts []func(*specs.Spec)
+	if len(extraMounts) > 0 {
+		opts = append(opts, withExtraMounts(extraMounts...))
+	}
+	createOCISpec(b, bundleDir, []string{"/bin/forever"}, opts...)
+
+	stdoutPath, stderrPath := createIOFifos(b, bundleDir)
+	ctx := namespaces.WithNamespace(b.Context(), ns)
+
+	params := startShim(b, shimBin, bundleDir, cid, ns)
+	conn := connectShim(b, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+	drainFifo(b, ctx, stdoutPath)
+	drainFifo(b, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(b, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		b.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
+		b.Fatal("start failed:", err)
+	}
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/hashverify", path, hashHex},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		b.Fatal("marshal exec spec:", err)
+	}
+
+	b.SetBytes(bigFileSize)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		execID := fmt.Sprintf("hashv-%d", i)
+		execStdout, execStderr := createIOFifos(b, b.TempDir())
+		drainFifo(b, ctx, execStdout)
+		drainFifo(b, ctx, execStderr)
+		b.StartTimer()
+
+		if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+			ID:     cid,
+			ExecID: execID,
+			Spec:   procSpec,
+			Stdout: execStdout,
+			Stderr: execStderr,
+		}); err != nil {
+			b.Fatal("exec failed:", err)
+		}
+		if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid, ExecID: execID}); err != nil {
+			b.Fatal("exec start failed:", err)
+		}
+		waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid, ExecID: execID})
+		if err != nil {
+			b.Fatal("exec wait failed:", err)
+		}
+		if waitResp.ExitStatus != 0 {
+			b.Fatalf("hashverify exit %d", waitResp.ExitStatus)
+		}
+
+		b.StopTimer()
+		if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid, ExecID: execID}); err != nil {
+			b.Fatal("exec delete failed:", err)
+		}
+		b.StartTimer()
+	}
+
+	b.StopTimer()
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
 	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
 }
