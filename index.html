@@ -1,4 +1,345 @@
-  <!DOCTYPE html>
-  <meta http-equiv="refresh" content="0; url=dev/bench/">
-  <p><a href="dev/bench/">shimtest benchmarks</a></p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shimtest benchmarks</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa;
+    --fg: #111827;
+    --muted: #6b7280;
+    --card-bg: #ffffff;
+    --border: #e5e7eb;
+    --border-strong: #d1d5db;
+    --accent: #1f6feb;
+    --grid: rgba(0, 0, 0, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --accent: #58a6ff;
+      --grid: rgba(255, 255, 255, 0.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  body {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 32px 24px 80px;
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  header .sub {
+    margin: 0 0 4px;
+    color: var(--muted);
+  }
+  header .meta {
+    margin: 0 0 28px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 20px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 18px 14px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .card h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+  }
+  .card .unit {
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .canvas-wrap {
+    flex: 1;
+    min-height: 260px;
+    position: relative;
+  }
+  footer {
+    margin-top: 48px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 13px;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 0.9em;
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .empty {
+    color: var(--muted);
+    font-style: italic;
+    padding: 32px 0;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>shimtest benchmarks</h1>
+  <p class="sub">Per-push benchmarks across containerd / nerdbox shim variants.</p>
+  <p class="meta">
+    Updated <span id="lastUpdate">—</span> ·
+    <a id="repoLink" href="#">repository</a> ·
+    <a href="dev/bench/">raw chart page</a>
+  </p>
+</header>
+<main id="charts"><p class="empty">Loading…</p></main>
+<footer>
+  <p>
+    Data from <code>dev/bench/data.js</code>, written by
+    <a href="https://github.com/benchmark-action/github-action-benchmark">github-action-benchmark</a>
+    on every push to <code>main</code>. Higher is better for throughput
+    units (<code>MB/s</code>); lower is better for time-per-op units
+    (<code>ns/op</code>).
+  </p>
+</footer>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="dev/bench/data.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  const data = window.BENCHMARK_DATA;
+  const main = document.getElementById("charts");
+
+  if (!data || !data.entries || Object.keys(data.entries).length === 0) {
+    main.innerHTML = '<p class="empty">No benchmark data yet. The next push to <code>main</code> will populate this page.</p>';
+    return;
+  }
+
+  // Header metadata.
+  document.getElementById("lastUpdate").textContent =
+    new Date(data.lastUpdate).toLocaleString();
+  const repoLink = document.getElementById("repoLink");
+  if (data.repoUrl) {
+    repoLink.href = data.repoUrl;
+    repoLink.textContent = data.repoUrl.replace(/^https?:\/\/(?:www\.)?/, "");
+  }
+
+  // Parse a single bench into (shortName, unit, value), returning null
+  // for the benchmark-action's multi-metric "combined" entries whose
+  // unit contains a tab — those are already split into `-` suffixed
+  // per-metric entries that we keep instead.
+  function parseBench(bench) {
+    if (typeof bench.unit !== "string" || bench.unit.indexOf("\t") !== -1) {
+      return null;
+    }
+    const segments = bench.name.split("/");
+    let last = segments[segments.length - 1];
+    const idx = last.lastIndexOf(" - ");
+    if (idx !== -1) last = last.substring(0, idx);
+    return { short: last, unit: bench.unit, value: bench.value };
+  }
+
+  // Build: key -> { short, unit, entries: { entryName -> [{x,y,commit}] } }
+  const cards = {};
+  for (const [entryName, runs] of Object.entries(data.entries)) {
+    for (const run of runs) {
+      for (const bench of run.benches || []) {
+        const p = parseBench(bench);
+        if (!p) continue;
+        const key = p.short + "|" + p.unit;
+        if (!cards[key]) {
+          cards[key] = { short: p.short, unit: p.unit, entries: {} };
+        }
+        const c = cards[key];
+        if (!c.entries[entryName]) c.entries[entryName] = [];
+        c.entries[entryName].push({
+          x: run.date,
+          y: p.value,
+          commit: run.commit,
+        });
+      }
+    }
+  }
+
+  // Sort points in each entry chronologically.
+  for (const c of Object.values(cards)) {
+    for (const pts of Object.values(c.entries)) {
+      pts.sort((a, b) => a.x - b.x);
+    }
+  }
+
+  // Stable palette assigned by entry name in sorted order.
+  const PALETTE = [
+    "#3b82f6", "#f97316", "#10b981", "#ef4444",
+    "#8b5cf6", "#06b6d4", "#eab308", "#ec4899",
+  ];
+  const entryOrder = [...new Set(
+    Object.values(cards).flatMap((c) => Object.keys(c.entries))
+  )].sort();
+  const entryColor = {};
+  entryOrder.forEach((name, i) => {
+    entryColor[name] = PALETTE[i % PALETTE.length];
+  });
+
+  // Chart.js global tweaks.
+  const docStyle = getComputedStyle(document.documentElement);
+  const fgColor = docStyle.getPropertyValue("--fg").trim() || "#111";
+  const mutedColor = docStyle.getPropertyValue("--muted").trim() || "#666";
+  const gridColor = docStyle.getPropertyValue("--grid").trim() || "rgba(0,0,0,0.08)";
+  Chart.defaults.color = fgColor;
+  Chart.defaults.borderColor = gridColor;
+  Chart.defaults.font.family = docStyle.fontFamily || Chart.defaults.font.family;
+
+  function lowerIsBetter(unit) {
+    const u = unit.toLowerCase();
+    return u.includes("ns") || u.includes("ms") || u.endsWith("/op");
+  }
+
+  function orderBenches(keys) {
+    // Stable bench ordering: put throughput (MB/s) after time cards
+    // for the same short name so related charts sit together, and
+    // sort alphabetically within a unit group.
+    const order = ["ns/op", "MB/s"];
+    return keys.sort((a, b) => {
+      const [sa, ua] = a.split("|");
+      const [sb, ub] = b.split("|");
+      if (sa !== sb) return sa.localeCompare(sb);
+      const ia = order.indexOf(ua);
+      const ib = order.indexOf(ub);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    });
+  }
+
+  main.innerHTML = "";
+  for (const key of orderBenches(Object.keys(cards))) {
+    const spec = cards[key];
+    const card = document.createElement("section");
+    card.className = "card";
+
+    const head = document.createElement("div");
+    head.className = "card-head";
+    const h2 = document.createElement("h2");
+    h2.textContent = spec.short;
+    const u = document.createElement("span");
+    u.className = "unit";
+    u.textContent =
+      spec.unit + " · " + (lowerIsBetter(spec.unit) ? "lower better" : "higher better");
+    head.appendChild(h2);
+    head.appendChild(u);
+    card.appendChild(head);
+
+    const wrap = document.createElement("div");
+    wrap.className = "canvas-wrap";
+    const canvas = document.createElement("canvas");
+    wrap.appendChild(canvas);
+    card.appendChild(wrap);
+    main.appendChild(card);
+
+    const datasets = [];
+    for (const [entryName, pts] of Object.entries(spec.entries)) {
+      const c = entryColor[entryName];
+      datasets.push({
+        label: entryName,
+        data: pts,
+        borderColor: c,
+        backgroundColor: c,
+        pointRadius: 3,
+        pointHoverRadius: 6,
+        borderWidth: 2,
+        tension: 0.15,
+      });
+    }
+
+    new Chart(canvas, {
+      type: "line",
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "nearest", axis: "x", intersect: false },
+        plugins: {
+          legend: {
+            position: "bottom",
+            align: "start",
+            labels: { boxWidth: 12, boxHeight: 12, padding: 10 },
+          },
+          tooltip: {
+            callbacks: {
+              title: (items) => new Date(items[0].parsed.x).toLocaleString(),
+              label: (ctx) => {
+                const commit = ctx.raw && ctx.raw.commit;
+                const shortSha = commit ? commit.id.substring(0, 7) : "";
+                const msg = commit ? commit.message.split("\n")[0] : "";
+                const val = ctx.parsed.y.toLocaleString(undefined, {
+                  maximumFractionDigits: 2,
+                });
+                const parts = [`${ctx.dataset.label}: ${val} ${spec.unit}`];
+                if (shortSha) parts.push(`${shortSha} — ${msg}`);
+                return parts;
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            type: "time",
+            time: { unit: "day" },
+            ticks: { color: mutedColor, maxRotation: 0 },
+            grid: { color: gridColor },
+          },
+          y: {
+            beginAtZero: !lowerIsBetter(spec.unit),
+            ticks: { color: mutedColor },
+            grid: { color: gridColor },
+            title: { display: true, text: spec.unit, color: mutedColor },
+          },
+        },
+      },
+    });
+  }
+})();
+</script>
+</body>
+</html>
