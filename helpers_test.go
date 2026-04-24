@@ -280,8 +280,13 @@ func drainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.B
 	tb.Cleanup(func() { f.Close() })
 }
 
-// newCreateTaskRequest builds a CreateTaskRequest with runc Options
-// configured for rootless operation when not running as root:
+// newCreateTaskRequest builds a CreateTaskRequest with runc Options.
+// SystemdCgroup is explicitly set to false on every request so both
+// root and rootless runs use the cgroupfs manager — otherwise root
+// on systemd hosts (notably GHA) pays tens of ms of DBus round-trips
+// per container lifecycle, skewing benchmark comparisons.
+//
+// Rootless paths additionally need:
 //   - IoUid/IoGid set to the current user (avoids chown EPERM)
 //   - Root set to a writable temp directory (avoids /run/containerd/runc EPERM)
 func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, rootfs []*types.Mount) *taskAPI.CreateTaskRequest {
@@ -293,24 +298,25 @@ func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, root
 		Stderr: stderr,
 		Rootfs: rootfs,
 	}
+	opts := &runcopt.Options{
+		SystemdCgroup: false,
+	}
 	uid := os.Getuid()
 	gid := os.Getgid()
 	if uid != 0 {
 		runcRoot := filepath.Join(os.TempDir(), "shimtest-runc")
 		os.MkdirAll(runcRoot, 0700)
-		opts := &runcopt.Options{
-			IoUid: uint32(uid),
-			IoGid: uint32(gid),
-			Root:  runcRoot,
-		}
-		any, err := typeurl.MarshalAnyToProto(opts)
-		if err != nil {
-			tb.Fatal("failed to marshal runc options:", err)
-		}
-		req.Options = &anypb.Any{
-			TypeUrl: any.TypeUrl,
-			Value:   any.Value,
-		}
+		opts.IoUid = uint32(uid)
+		opts.IoGid = uint32(gid)
+		opts.Root = runcRoot
+	}
+	any, err := typeurl.MarshalAnyToProto(opts)
+	if err != nil {
+		tb.Fatal("failed to marshal runc options:", err)
+	}
+	req.Options = &anypb.Any{
+		TypeUrl: any.TypeUrl,
+		Value:   any.Value,
 	}
 	return req
 }
