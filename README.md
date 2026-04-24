@@ -119,6 +119,11 @@ Candidates to add later, ranked roughly by value:
 
 ## Benchmarks
 
+A subset of these benchmarks runs against `runc-rootless` and `nerdbox`
+on every push to `main` and is published as time-series charts at
+<https://dmcgowan.github.io/shimtest/dev/bench/> (gh-pages).
+
+
 Benchmarks live under `BenchmarkShim/<config-name>/<bench-name>`.
 
 | Benchmark | Feature | Description |

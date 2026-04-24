@@ -90,6 +90,34 @@ jobs:
           sudo _output/shimtest.test -test.v -test.timeout=120s \
             -shimtest.config=.github/workflows/profiles/runc.json
 
+      - name: Run benchmarks (rootless)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          _output/shimtest.test -test.run='^$' \
+            -test.bench='BenchmarkShim/.*/(ReadLargeFile|ReadBindMount|Lifecycle|Startup|Exec)$' \
+            -test.benchtime=5x \
+            -test.timeout=300s \
+            -shimtest.config=.github/workflows/profiles/runc-rootless.json | tee bench-rootless.txt
+
+      - name: Run benchmarks (root)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          sudo _output/shimtest.test -test.run='^$' \
+            -test.bench='BenchmarkShim/.*/(ReadLargeFile|ReadBindMount|Lifecycle|Startup|Exec)$' \
+            -test.benchtime=5x \
+            -test.timeout=300s \
+            -shimtest.config=.github/workflows/profiles/runc.json | tee bench-root.txt
+
+      - name: Upload benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-runc-${{ matrix.containerd }}
+          path: |
+            bench-rootless.txt
+            bench-root.txt
+          if-no-files-found: error
+
   test-nerdbox-shim:
     name: Test nerdbox shim
     runs-on: ubuntu-24.04
@@ -190,3 +218,96 @@ jobs:
         run: |
           _output/shimtest.test -test.v -test.timeout=300s \
             -shimtest.config=.github/workflows/profiles/nerdbox.json
+
+      - name: Run benchmarks
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          _output/shimtest.test -test.run='^$' \
+            -test.bench='BenchmarkShim/.*/(ReadLargeFile|ReadBindMount|Lifecycle|Startup|Exec)$' \
+            -test.benchtime=5x \
+            -test.timeout=600s \
+            -shimtest.config=.github/workflows/profiles/nerdbox.json | tee bench.txt
+
+      - name: Upload benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-nerdbox-main
+          path: bench.txt
+          if-no-files-found: error
+
+  publish-benchmarks:
+    name: Publish benchmarks
+    # Only runs on push to main, once all bench-producing jobs succeed.
+    # This is the only job with write scope; the test jobs above run
+    # arbitrary third-party binaries (runc, nerdbox, containerd) and
+    # are deliberately read-only.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test-runc-shim, test-nerdbox-shim]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # push to gh-pages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bench-*
+          path: bench-artifacts/
+
+      - name: List downloaded artifacts
+        run: find bench-artifacts -type f | sort
+
+      - name: Publish runc rootless / containerd v2.3.0-beta.2
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: runc rootless / containerd v2.3.0-beta.2
+          tool: 'go'
+          output-file-path: bench-artifacts/bench-runc-v2.3.0-beta.2/bench-rootless.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: 'dev/bench'
+
+      - name: Publish runc root / containerd v2.3.0-beta.2
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: runc root / containerd v2.3.0-beta.2
+          tool: 'go'
+          output-file-path: bench-artifacts/bench-runc-v2.3.0-beta.2/bench-root.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: 'dev/bench'
+
+      - name: Publish runc rootless / containerd main
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: runc rootless / containerd main
+          tool: 'go'
+          output-file-path: bench-artifacts/bench-runc-main/bench-rootless.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: 'dev/bench'
+
+      - name: Publish runc root / containerd main
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: runc root / containerd main
+          tool: 'go'
+          output-file-path: bench-artifacts/bench-runc-main/bench-root.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: 'dev/bench'
+
+      - name: Publish nerdbox (main)
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: nerdbox (main)
+          tool: 'go'
+          output-file-path: bench-artifacts/bench-nerdbox-main/bench.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: 'dev/bench'
