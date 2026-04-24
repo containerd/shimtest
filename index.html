@@ -170,15 +170,53 @@
   // for the benchmark-action's multi-metric "combined" entries whose
   // unit contains a tab — those are already split into `-` suffixed
   // per-metric entries that we keep instead.
+  //
+  // Strip the " - <unit>" suffix BEFORE splitting on "/" — the unit
+  // itself can contain a slash (e.g. "MB/s"), so splitting first would
+  // eat the display name.
   function parseBench(bench) {
     if (typeof bench.unit !== "string" || bench.unit.indexOf("\t") !== -1) {
       return null;
     }
-    const segments = bench.name.split("/");
-    let last = segments[segments.length - 1];
-    const idx = last.lastIndexOf(" - ");
-    if (idx !== -1) last = last.substring(0, idx);
-    return { short: last, unit: bench.unit, value: bench.value };
+    let name = bench.name;
+    const idx = name.lastIndexOf(" - ");
+    if (idx !== -1) name = name.substring(0, idx);
+    const segments = name.split("/");
+    const last = segments[segments.length - 1];
+    let value = bench.value;
+    let unit = bench.unit;
+    // Rescale nanoseconds to milliseconds — ns/op readings for shim
+    // work are tens to hundreds of millions of ns; ms is easier to
+    // eyeball.
+    if (unit.startsWith("ns")) {
+      value = value / 1e6;
+      unit = "ms" + unit.substring(2);
+    }
+    return { short: last, unit, value };
+  }
+
+  // Display names for chart legends. Keeps the raw key from data.js
+  // stable (so historical data joins correctly) but renders something
+  // friendlier.
+  function displayEntry(name) {
+    // nerdbox (main) → unchanged
+    if (name.startsWith("nerdbox ")) return name;
+    // runc root / containerd X → runc (X)
+    let m = name.match(/^runc root \/ containerd (.+)$/);
+    if (m) return "runc (" + m[1] + ")";
+    // runc rootless / containerd X → runc (X, rootless)
+    m = name.match(/^runc rootless \/ containerd (.+)$/);
+    if (m) return "runc (" + m[1] + ", rootless)";
+    return name;
+  }
+
+  // Sort entries: nerdbox first, then runc root (across containerd
+  // versions), then runc rootless, then alphabetical fallback.
+  function entrySortKey(name) {
+    if (name.startsWith("nerdbox ")) return [0, name];
+    if (name.startsWith("runc root /")) return [1, name];
+    if (name.startsWith("runc rootless /")) return [2, name];
+    return [3, name];
   }
 
   // Build: key -> { short, unit, entries: { entryName -> [{x,y,commit}] } }
@@ -210,14 +248,20 @@
     }
   }
 
-  // Stable palette assigned by entry name in sorted order.
+  // Stable palette assigned by entry group in the order requested:
+  // nerdbox → runc root → runc rootless → anything else.
   const PALETTE = [
     "#3b82f6", "#f97316", "#10b981", "#ef4444",
     "#8b5cf6", "#06b6d4", "#eab308", "#ec4899",
   ];
   const entryOrder = [...new Set(
     Object.values(cards).flatMap((c) => Object.keys(c.entries))
-  )].sort();
+  )].sort((a, b) => {
+    const ka = entrySortKey(a);
+    const kb = entrySortKey(b);
+    if (ka[0] !== kb[0]) return ka[0] - kb[0];
+    return ka[1].localeCompare(kb[1]);
+  });
   const entryColor = {};
   entryOrder.forEach((name, i) => {
     entryColor[name] = PALETTE[i % PALETTE.length];
@@ -278,10 +322,12 @@
     main.appendChild(card);
 
     const datasets = [];
-    for (const [entryName, pts] of Object.entries(spec.entries)) {
+    for (const entryName of entryOrder) {
+      const pts = spec.entries[entryName];
+      if (!pts) continue;
       const c = entryColor[entryName];
       datasets.push({
-        label: entryName,
+        label: displayEntry(entryName),
         data: pts,
         borderColor: c,
         backgroundColor: c,
