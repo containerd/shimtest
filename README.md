@@ -135,3 +135,92 @@ Benchmarks live under `BenchmarkShim/<config-name>/<bench-name>`.
 | `Exec` | exec | Exec cycle inside a running container (exec/start/wait/delete) |
 | `StdioRoundTrip` | exec | Stdio write/read at 8B, 4KB, 4MB |
 | `UDSRoundTrip` | uds | UDS forwarded-socket throughput in both directions (HostToContainer, ContainerToHost) at 8B, 4KB, 4MB |
+
+## Using shimtest in your shim's CI
+
+To run shimtest as part of your own shim project's CI, your job needs
+to: build your shim, check out and build shimtest, write a JSON profile
+that points at your binary, then run `shimtest.test` against it.
+
+### Minimal workflow snippet
+
+```yaml
+- name: Build my shim
+  run: |
+    make my-shim   # produces ./bin/containerd-shim-myshim-v1
+    echo "$(pwd)/bin" >> $GITHUB_PATH
+
+- name: Allow unprivileged user namespaces
+  # Only needed if your profile uses a non-zero uid on Ubuntu 24.04+.
+  run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+- name: Check out shimtest
+  uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  with:
+    repository: dmcgowan/shimtest
+    ref: <commit-sha>   # pin a commit
+    path: shimtest
+
+- name: Setup Go
+  uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+  with:
+    go-version: "1.26.x"
+
+- name: Build shimtest
+  working-directory: shimtest
+  run: make build
+
+- name: Write shimtest profile
+  run: |
+    cat > shimtest/myshim.json <<'EOF'
+    {
+      "shim_binary": "containerd-shim-myshim-v1",
+      "skip": ["transfer", "uds"]
+    }
+    EOF
+
+- name: Run shimtest
+  working-directory: shimtest
+  run: |
+    _output/shimtest.test -test.v -test.timeout=300s \
+      -shimtest.config=myshim.json
+```
+
+### What you'll need to configure
+
+- **`shim_binary`**: bare name (resolved via `PATH`) or absolute path.
+  shimtest also adds the binary's directory to `PATH` so sibling
+  helpers (kernels, libraries) co-located with the shim resolve.
+- **`format_mounts`**: set `true` if your shim mounts the rootfs
+  itself from `format/mkdir/overlay` descriptors (VM-based shims);
+  leave `false` to receive a pre-mounted overlay or plain directory.
+- **`uid`**: omit to run as the runner user. Set explicitly when you
+  want the harness to `sudo` re-exec itself or rewrite the profile.
+- **`skip`**: list of feature names to disable. Currently meaningful
+  values are `exec`, `oom`, `transfer`, and `uds` — useful when your
+  shim doesn't implement transfer/UDS forwarding or when running
+  rootless without cgroup delegation.
+
+### Multiple configs
+
+If you want one job to test several profiles (e.g., rootless and root
+variants of the same shim) put the JSON files under a directory and
+pass `-shimtest.configdir=` instead of `-shimtest.config=`. Each file
+becomes a `TestShim/<filename>/...` subtest. Profiles whose `uid`
+differs from the running process are skipped, or `sudo`-re-exec'd
+when the harness is running as root.
+
+### Benchmarks
+
+The benchmark binary is the same as the test binary — just point
+`-test.bench` at the suite and disable tests:
+
+```yaml
+- name: Run benchmarks
+  working-directory: shimtest
+  run: |
+    _output/shimtest.test -test.run='^$' \
+      -test.bench='BenchmarkShim/myshim/(Lifecycle|Startup|Exec)' \
+      -test.benchtime=5x \
+      -shimtest.config=myshim.json | tee bench.txt
+```
