@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -46,8 +47,14 @@ func testShimUDSRoundTrip(t *testing.T) {
 	containerID := containerID(t)
 	ns := shimtestNamespace
 
-	// Create a host-side UDS listener.
-	hostSockDir := t.TempDir()
+	// Create a host-side UDS listener. Use a short /tmp path because
+	// macOS AF_UNIX paths are limited to 104 bytes and t.TempDir()
+	// paths include the full test name.
+	hostSockDir, err := os.MkdirTemp("/tmp", "nb-uds-")
+	if err != nil {
+		t.Fatal("create uds dir:", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(hostSockDir) })
 	hostSockPath := filepath.Join(hostSockDir, "test.sock")
 	ln, err := net.Listen("unix", hostSockPath)
 	if err != nil {
@@ -183,7 +190,11 @@ func benchmarkShimUDSRoundTrip(b *testing.B) {
 	cid := containerID(b)
 	ns := shimtestNamespace
 
-	hostSockDir := b.TempDir()
+	hostSockDir, err := os.MkdirTemp("/tmp", "nb-uds-")
+	if err != nil {
+		b.Fatal("create uds dir:", err)
+	}
+	b.Cleanup(func() { os.RemoveAll(hostSockDir) })
 	hostSockPath := filepath.Join(hostSockDir, "bench.sock")
 	ln, err := net.Listen("unix", hostSockPath)
 	if err != nil {

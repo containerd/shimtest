@@ -200,10 +200,36 @@ func shimSetup(tb testing.TB) (shimBin, bundleDir string, rootfsMounts []*types.
 	return shimBin, bundleDir, rootfsMounts
 }
 
-// containerdSockPath is the unix socket path inside a bundle that the
-// shim dials as its containerd events endpoint.
-func containerdSockPath(bundleDir string) string {
-	return filepath.Join(bundleDir, "c.sock")
+// shortSocketPaths caches the short-path mapping so that multiple
+// calls to containerdSockPath for the same bundleDir return the same
+// path.
+var shortSocketPaths sync.Map
+
+// containerdSockPath returns the unix socket path the shim dials as
+// its containerd events endpoint. On macOS, AF_UNIX paths are limited
+// to 104 bytes, so we fall back to a short /tmp path when the bundle
+// directory is too deep. Results are cached per bundleDir so all
+// callers within the same test get the same path.
+func containerdSockPath(tb testing.TB, bundleDir string) string {
+	tb.Helper()
+	candidate := filepath.Join(bundleDir, "c.sock")
+	if len(candidate) <= 104 {
+		return candidate
+	}
+	if v, ok := shortSocketPaths.Load(bundleDir); ok {
+		return v.(string)
+	}
+	dir, err := os.MkdirTemp("/tmp", "nb-ev-")
+	if err != nil {
+		tb.Fatal("create short socket dir:", err)
+	}
+	p := filepath.Join(dir, "c.sock")
+	shortSocketPaths.Store(bundleDir, p)
+	tb.Cleanup(func() {
+		shortSocketPaths.Delete(bundleDir)
+		os.RemoveAll(dir)
+	})
+	return p
 }
 
 // createIOFifos creates stdout and stderr FIFOs in the given directory.
@@ -435,7 +461,7 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 		<-done
 	})
 
-	containerdAddr := containerdSockPath(bundleDir)
+	containerdAddr := containerdSockPath(tb, bundleDir)
 
 	// Build bootstrap params to send on stdin (new protocol).
 	bootParams := &bootapi.BootstrapParams{

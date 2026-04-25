@@ -92,7 +92,7 @@ func (r *eventRecorder) waitForTopic(topic string, timeout time.Duration) *types
 func startEventsRecorder(tb testing.TB, bundleDir string) *eventRecorder {
 	tb.Helper()
 
-	socketPath := containerdSockPath(bundleDir)
+	socketPath := containerdSockPath(tb, bundleDir)
 
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
