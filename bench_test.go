@@ -39,9 +39,13 @@ import (
 
 // benchmarkShimLifecycle measures the full create-start-kill-wait-delete
 // lifecycle of a container through the shim, including the shim start.
+// Per-phase durations are reported as custom metrics so regressions can
+// be localized to a specific RPC.
 func benchmarkShimLifecycle(b *testing.B) {
 	base := containerID(b)
 	ns := shimtestNamespace
+
+	var sumShim, sumCreate, sumStart, sumKill, sumWait, sumDelete time.Duration
 
 	b.ResetTimer()
 
@@ -60,31 +64,58 @@ func benchmarkShimLifecycle(b *testing.B) {
 
 		b.StartTimer()
 
+		t := time.Now()
 		params := startShim(b, shimBin, bundleDir, cid, ns)
 		conn := connectShim(b, params.Address)
 		client := ttrpc.NewClient(conn)
 		tc := taskAPI.NewTTRPCTaskClient(client)
+		sumShim += time.Since(t)
 
+		t = time.Now()
 		if _, err := tc.Create(ctx, newCreateTaskRequest(b, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 			b.Fatal("create failed:", err)
 		}
+		sumCreate += time.Since(t)
+
+		t = time.Now()
 		if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 			b.Fatal("start failed:", err)
 		}
+		sumStart += time.Since(t)
+
+		t = time.Now()
 		if _, err := tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true}); err != nil {
 			b.Fatal("kill failed:", err)
 		}
+		sumKill += time.Since(t)
+
+		t = time.Now()
 		if _, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid}); err != nil {
 			b.Fatal("wait failed:", err)
 		}
+		sumWait += time.Since(t)
+
+		t = time.Now()
 		if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid}); err != nil {
 			b.Fatal("delete failed:", err)
 		}
+		sumDelete += time.Since(t)
 
 		b.StopTimer()
 		tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
 		client.Close()
 	}
+
+	n := float64(b.N)
+	reportMs := func(d time.Duration, name string) {
+		b.ReportMetric(float64(d.Microseconds())/n/1000.0, name)
+	}
+	reportMs(sumShim, "ms/shim-start")
+	reportMs(sumCreate, "ms/create")
+	reportMs(sumStart, "ms/start")
+	reportMs(sumKill, "ms/kill")
+	reportMs(sumWait, "ms/wait")
+	reportMs(sumDelete, "ms/delete")
 }
 
 // benchmarkShimStartup measures the time from shim start through the
