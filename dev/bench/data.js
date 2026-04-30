@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1777573060895,
+  "lastUpdate": 1777573061925,
   "repoUrl": "https://github.com/dmcgowan/shimtest",
   "entries": {
     "runc rootless / containerd v2.3.0-beta.2": [
@@ -2256,6 +2256,126 @@ window.BENCHMARK_DATA = {
           {
             "name": "BenchmarkShim/nerdbox/ReadBindMount - MB/s",
             "value": 1194.17,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "derek@mcg.dev",
+            "name": "Derek McGowan",
+            "username": "dmcgowan"
+          },
+          "committer": {
+            "email": "derek@mcg.dev",
+            "name": "Derek McGowan",
+            "username": "dmcgowan"
+          },
+          "distinct": true,
+          "id": "ada1246fb1020406703f346d16c3f20a0c3df635",
+          "message": "Add stress tests\n\nThese tests currently fail with nerdbox but will help find a solution\n\nSigned-off-by: Derek McGowan <derek@mcg.dev>",
+          "timestamp": "2026-04-30T11:05:02-07:00",
+          "tree_id": "99710c7414bf76dac00c98b5d9f9acd6b7d90aea",
+          "url": "https://github.com/dmcgowan/shimtest/commit/ada1246fb1020406703f346d16c3f20a0c3df635"
+        },
+        "date": 1777573061584,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle",
+            "value": 220473974,
+            "unit": "ns/op\t       191.0 ms/create\t         5.742 ms/delete\t         6.195 ms/kill\t         7.657 ms/shim-start\t         5.273 ms/start\t         4.639 ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ns/op",
+            "value": 220473974,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/create",
+            "value": 191,
+            "unit": "ms/create",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/delete",
+            "value": 5.742,
+            "unit": "ms/delete",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/kill",
+            "value": 6.195,
+            "unit": "ms/kill",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/shim-start",
+            "value": 7.657,
+            "unit": "ms/shim-start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/start",
+            "value": 5.273,
+            "unit": "ms/start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Lifecycle - ms/wait",
+            "value": 4.639,
+            "unit": "ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Startup",
+            "value": 207249622,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/Exec",
+            "value": 10976801,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadLargeFile",
+            "value": 27678556,
+            "unit": "ns/op\t2424.58 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadLargeFile - ns/op",
+            "value": 27678556,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadLargeFile - MB/s",
+            "value": 2424.58,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadBindMount",
+            "value": 76558114,
+            "unit": "ns/op\t 876.57 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadBindMount - ns/op",
+            "value": 76558114,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/nerdbox/ReadBindMount - MB/s",
+            "value": 876.57,
             "unit": "MB/s",
             "extra": "5 times\n4 procs"
           }
