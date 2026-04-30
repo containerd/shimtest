@@ -44,7 +44,7 @@ import (
 
 func testTransferCopyTo(t *testing.T) {
 	skipFeature(t, "transfer")
-	env := newShimEnv(t)
+	env := newShimEnv(t, t.Context())
 	ctx := env.ctx
 
 	const testContent = "transfer-test-data-12345\n"
@@ -60,7 +60,7 @@ func testTransferCopyTo(t *testing.T) {
 
 func testTransferCopyToAndFrom(t *testing.T) {
 	skipFeature(t, "transfer")
-	env := newShimEnv(t)
+	env := newShimEnv(t, t.Context())
 	ctx := env.ctx
 
 	const testContent = "transfer-test-data-12345\n"
@@ -82,7 +82,7 @@ func testTransferCopyToAndFrom(t *testing.T) {
 
 func testTransferExecVerify(t *testing.T) {
 	skipFeature(t, "transfer")
-	env := newShimEnv(t)
+	env := newShimEnv(t, t.Context())
 	ctx := env.ctx
 
 	const testContent = "transfer-test-data-12345\n"
@@ -111,30 +111,32 @@ type shimEnv struct {
 }
 
 // newShimEnv starts a shim, creates and starts a container, and returns
-// the environment for further operations.
-func newShimEnv(t *testing.T) *shimEnv {
-	t.Helper()
+// the environment for further operations. Accepts any testing.TB plus
+// a base context (typically t.Context() or f.Context()) so the same
+// helper can drive regular tests, benchmarks, and fuzz tests.
+func newShimEnv(tb testing.TB, baseCtx context.Context) *shimEnv {
+	tb.Helper()
 
-	shimBin, bundleDir, rootfsMounts := shimSetup(t)
+	shimBin, bundleDir, rootfsMounts := shimSetup(tb)
 
-	containerID := containerID(t)
+	containerID := containerID(tb)
 	ns := shimtestNamespace
 
 	// OCI spec must exist before starting the shim (readSpec in "start" mode).
 	// Use "sh -c" with sleep so the container stays alive for transfer operations.
-	createOCISpec(t, bundleDir, []string{"/bin/forever"})
+	createOCISpec(tb, bundleDir, []string{"/bin/forever"})
 
 	// Create FIFOs for task IO (the initial process doesn't produce
 	// interesting output, but the shim requires them).
-	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	stdoutPath, stderrPath := createIOFifos(tb, bundleDir)
 
-	ctx := namespaces.WithNamespace(t.Context(), ns)
+	ctx := namespaces.WithNamespace(baseCtx, ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, ns)
+	params := startShim(tb, shimBin, bundleDir, containerID, ns)
 
-	conn := connectShim(t, params.Address)
+	conn := connectShim(tb, params.Address)
 	client := ttrpc.NewClient(conn)
-	t.Cleanup(func() { client.Close() })
+	tb.Cleanup(func() { client.Close() })
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 	// Probe the transfer service — skip transfer tests for shims
@@ -149,21 +151,21 @@ func newShimEnv(t *testing.T) *shimEnv {
 		// started yet), etc. Only skip if the error indicates the service
 		// method itself doesn't exist (ttrpc returns "Unimplemented").
 		if strings.Contains(msg, "Unimplemented") || strings.Contains(msg, "unknown service") {
-			t.Skip("skipping: shim does not support transfer service:", probeErr)
+			tb.Skip("skipping: shim does not support transfer service:", probeErr)
 		}
 	}
 
 	sc := &ttrpcStreamCreator{client: streamingapi.NewTTRPCStreamingClient(client)}
 
 	// Open FIFOs and drain them
-	drainFifo(t, ctx, stdoutPath)
-	drainFifo(t, ctx, stderrPath)
-	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
-		t.Fatal("failed to create task:", err)
+	drainFifo(tb, ctx, stdoutPath)
+	drainFifo(tb, ctx, stderrPath)
+	if _, err := tc.Create(ctx, newCreateTaskRequest(tb, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		tb.Fatal("failed to create task:", err)
 	}
 
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
-		t.Fatal("failed to start task:", err)
+		tb.Fatal("failed to start task:", err)
 	}
 
 	return &shimEnv{
@@ -405,7 +407,7 @@ type ttrpcStreamCreator struct {
 func (sc *ttrpcStreamCreator) Create(ctx context.Context, id string) (streaming.Stream, error) {
 	stream, err := sc.client.Stream(ctx)
 	if err != nil {
-		return nil, err
+		return nil, toNative(err)
 	}
 
 	a, err := typeurl.MarshalAny(&streamingapi.StreamInit{ID: id})
@@ -413,12 +415,12 @@ func (sc *ttrpcStreamCreator) Create(ctx context.Context, id string) (streaming.
 		return nil, err
 	}
 	if err := stream.Send(typeurl.MarshalProto(a)); err != nil {
-		return nil, errgrpc.ToNative(err)
+		return nil, toNative(err)
 	}
 
 	// Wait for ack
 	if _, err := stream.Recv(); err != nil {
-		return nil, errgrpc.ToNative(err)
+		return nil, toNative(err)
 	}
 
 	return &ttrpcStream{s: stream}, nil

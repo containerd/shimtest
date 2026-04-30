@@ -81,13 +81,15 @@ jobs:
           cat .github/workflows/profiles/runc-rootless.json
 
       - name: Run tests (rootless)
+        # -test.short skips the long-running Stress test. Drop it
+        # in a separate soak job to exercise stress.
         run: |
-          _output/shimtest.test -test.v -test.timeout=120s \
+          _output/shimtest.test -test.v -test.short -test.timeout=120s \
             -shimtest.config=.github/workflows/profiles/runc-rootless.json
 
       - name: Run tests (root)
         run: |
-          sudo _output/shimtest.test -test.v -test.timeout=120s \
+          sudo _output/shimtest.test -test.v -test.short -test.timeout=120s \
             -shimtest.config=.github/workflows/profiles/runc.json
 
       - name: Run benchmarks (rootless)
@@ -215,8 +217,10 @@ jobs:
         run: make build
 
       - name: Run tests
+        # -test.short skips the long-running Stress test. Drop it
+        # in a separate soak job to exercise stress.
         run: |
-          _output/shimtest.test -test.v -test.timeout=300s \
+          _output/shimtest.test -test.v -test.short -test.timeout=300s \
             -shimtest.config=.github/workflows/profiles/nerdbox.json
 
       - name: Run benchmarks

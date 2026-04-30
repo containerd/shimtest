@@ -46,6 +46,7 @@ func TestShim(t *testing.T) {
 			t.Run("TransferCopyToAndFrom", testTransferCopyToAndFrom)
 			t.Run("TransferExecVerify", testTransferExecVerify)
 			t.Run("UDSRoundTrip", testShimUDSRoundTrip)
+			t.Run("Stress", testStress)
 		})
 	}
 }

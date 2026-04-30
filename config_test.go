@@ -211,24 +211,33 @@ func activateConfig(cfg Config) {
 }
 
 // skipFeature skips the current test if the given feature is listed in
-// the config's Skip list.
-func skipFeature(t *testing.T, feature string) {
-	t.Helper()
-	for _, s := range testCfg.Skip {
-		if s == feature {
-			t.Skipf("feature %q disabled in config", feature)
-		}
+// the config's Skip list. Accepts any testing.TB, so it works for
+// regular tests, benchmarks, and fuzz tests.
+func skipFeature(tb testing.TB, feature string) {
+	tb.Helper()
+	if featureSkipped(feature) {
+		tb.Skipf("feature %q disabled in config", feature)
 	}
 }
 
-// skipFeatureBench is the benchmark equivalent of skipFeature.
-func skipFeatureBench(b *testing.B, feature string) {
-	b.Helper()
+// featureSkipped reports whether the given feature is listed in the
+// config's Skip list. Useful for tests that conditionally compose
+// subtests (only adding ones whose feature is enabled) rather than
+// skipping outright via skipFeature.
+func featureSkipped(feature string) bool {
 	for _, s := range testCfg.Skip {
 		if s == feature {
-			b.Skipf("feature %q disabled in config", feature)
+			return true
 		}
 	}
+	return false
+}
+
+// skipFeatureBench is kept as a thin alias for backward compatibility
+// with existing benchmark callers.
+func skipFeatureBench(b *testing.B, feature string) {
+	b.Helper()
+	skipFeature(b, feature)
 }
 
 // checkRunnable returns an empty string if the config can run in the

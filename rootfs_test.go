@@ -58,6 +58,19 @@ const bigFileSize = 64 << 20 // 64 MiB
 // mount (in different tests).
 const bigFileContainerPath = "/data/bigfile"
 
+// statDirContainerPath is a small directory in the secondary erofs
+// layer used as the target for stress stat operations. Transferring
+// it with NoWalk=true produces a tar archive containing only the
+// directory header — the cheapest possible bidirectional-stream
+// payload.
+const statDirContainerPath = "/data/stat"
+
+// statFileContainerPath is a small fixed file inside statDirContainerPath
+// that the stat directory can also be probed against. Provided so that
+// the directory has at least one entry — the stress stat itself
+// targets the directory.
+const statFileContainerPath = "/data/stat/probe"
+
 // bigFileSeed is the ChaCha8 seed used to generate the fixture
 // payload. Any change here invalidates the cached hash.
 var bigFileSeed = [32]byte{
@@ -148,6 +161,26 @@ func writeBigFileErofs(tb testing.TB) string {
 	}
 	if err := bf.Close(); err != nil {
 		tb.Fatal("close bigfile:", err)
+	}
+
+	// Stress stat fixture: a small directory containing a single file.
+	// The directory itself is the typical stat target — transferring
+	// it with NoWalk=true returns only the directory header entry.
+	if err := w.Mkdir("data/stat", 0755); err != nil {
+		tb.Fatal("mkdir data/stat:", err)
+	}
+	pf, err := w.Create("data/stat/probe")
+	if err != nil {
+		tb.Fatal("create probe entry:", err)
+	}
+	if _, err := pf.Write([]byte("probe\n")); err != nil {
+		tb.Fatal("write probe:", err)
+	}
+	if err := pf.Chmod(0644); err != nil {
+		tb.Fatal("chmod probe:", err)
+	}
+	if err := pf.Close(); err != nil {
+		tb.Fatal("close probe:", err)
 	}
 
 	if err := w.Close(); err != nil {

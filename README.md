@@ -104,6 +104,13 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
 | `TransferExecVerify` | transfer | Copy a file in, verify via exec |
 | `UDSRoundTrip` | uds | UDS socket forwarding round-trip |
+| `Stress` | (per feature) | Long-running concurrent stress run. Composes subtests from the enabled features (currently transfer: stat/write/read). Each subtest runs as a goroutine until the test deadline approaches or any one fails (which cancels the rest). Skipped under `-test.short`. |
+
+A separate top-level fuzz target exists alongside `TestShim`:
+
+| Fuzz target | Feature | Description |
+|---|---|---|
+| `FuzzTransferMissing` | transfer | Fuzzes the transfer service's not-found path. Without `-fuzz` only the seed corpus runs (sub-second); with `-fuzz=FuzzTransferMissing` it generates new inputs continuously until `-fuzztime` elapses or a failing input is found. |
 
 ### Planned tests
 
@@ -182,7 +189,26 @@ that points at your binary, then run `shimtest.test` against it.
 - name: Run shimtest
   working-directory: shimtest
   run: |
-    _output/shimtest.test -test.v -test.timeout=300s \
+    _output/shimtest.test -test.v -test.short -test.timeout=300s \
+      -shimtest.config=myshim.json
+```
+
+The `-test.short` flag opts out of the long-running `Stress` test;
+the fuzz target's seed corpus runs either way (it's fast). Drop
+`-test.short` from a separate nightly/soak job to exercise the
+unbounded `Stress` run, and run active fuzzing as its own step:
+
+```yaml
+- name: Run shimtest soak (nightly)
+  working-directory: shimtest
+  run: |
+    _output/shimtest.test -test.v -test.timeout=15m \
+      -test.run='TestShim/myshim/Stress' \
+      -shimtest.config=myshim.json
+    # Active fuzzing in a separate step:
+    _output/shimtest.test -test.run='^$' \
+      -test.fuzz=FuzzTransferMissing -test.fuzztime=10m \
+      -test.fuzzcachedir=$RUNNER_TEMP/fuzzcache \
       -shimtest.config=myshim.json
 ```
 
