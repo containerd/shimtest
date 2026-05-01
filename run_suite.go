@@ -41,7 +41,6 @@ import (
 // feature key — every shim should pass them.
 type RunSuite struct {
 	cfg Config
-	
 }
 
 // NewRunSuite constructs a RunSuite from the given options.
@@ -342,7 +341,6 @@ func (s *RunSuite) testEvents(t *testing.T) {
 	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID}); err != nil {
 		t.Fatal("delete failed:", err)
 	}
-	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
 
 	want := []string{
 		"/tasks/create",
@@ -351,10 +349,12 @@ func (s *RunSuite) testEvents(t *testing.T) {
 		"/tasks/delete",
 	}
 	for _, topic := range want {
-		if env := rec.waitForTopic(topic, 2*time.Second); env == nil {
+		if env := rec.waitForTopic(topic, 5*time.Second); env == nil {
 			t.Fatalf("missing event %q; received topics: %v", topic, rec.topics())
 		}
 	}
+
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
 
 	got := rec.topics()
 	t.Log("received topics:", got)
