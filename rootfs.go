@@ -39,35 +39,35 @@ import (
 //go:embed _output/testbin.gz
 var testbinGz []byte
 
-// OpenTestbin returns a reader for the decompressed testbin binary.
-func OpenTestbin() (io.Reader, error) {
+// openTestbin returns a reader for the decompressed testbin binary.
+func openTestbin() (io.Reader, error) {
 	return gzip.NewReader(bytes.NewReader(testbinGz))
 }
 
-// TestbinCommands lists the commands provided by the testbin binary.
+// testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command in the embedded
 // rootfs.
-var TestbinCommands = []string{"forever", "cat", "date", "echo", "exit", "hashverify", "memhog", "nc", "tickexit"}
+var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "hashverify", "memhog", "nc", "tickexit"}
 
-// BigFileSize is the size of the IO benchmark fixture file. Large
+// bigFileSize is the size of the IO benchmark fixture file. Large
 // enough to swamp small per-call overheads while still building /
 // extracting in well under a second on host storage.
-const BigFileSize = 64 << 20 // 64 MiB
+const bigFileSize = 64 << 20 // 64 MiB
 
-// BigFileContainerPath is where the IO fixture file is mounted
+// bigFileContainerPath is where the IO fixture file is mounted
 // inside the container, both via the dedicated erofs layer and via
 // host bind mount (in different tests).
-const BigFileContainerPath = "/data/bigfile"
+const bigFileContainerPath = "/data/bigfile"
 
-// StatDirContainerPath is a small directory in the secondary erofs
+// statDirContainerPath is a small directory in the secondary erofs
 // layer used as the target for stress stat operations. Transferring
 // it with NoWalk=true produces a tar archive containing only the
 // directory header — the cheapest possible bidirectional-stream
 // payload.
-const StatDirContainerPath = "/data/stat"
+const statDirContainerPath = "/data/stat"
 
-// StatFileContainerPath is a small fixed file inside StatDirContainerPath.
-const StatFileContainerPath = "/data/stat/probe"
+// statFileContainerPath is a small fixed file inside statDirContainerPath.
+const statFileContainerPath = "/data/stat/probe"
 
 // bigFileSeed is the ChaCha8 seed used to generate the fixture
 // payload. Any change here invalidates the cached hash.
@@ -76,26 +76,27 @@ var bigFileSeed = [32]byte{
 	'b', 'i', 'g', 'f', 'i', 'l', 'e', 'v', '1',
 }
 
-// BigFileReader streams deterministic ChaCha8-seeded bytes up to
-// BigFileSize and computes the crc32-Castagnoli of what it produced.
-// The hash is available via HashHex once Read has returned io.EOF.
-type BigFileReader struct {
+// bigFileReader streams deterministic ChaCha8-seeded bytes up to
+// bigFileSize and computes the crc32-Castagnoli of what it produced.
+type bigFileReader struct {
 	src    *rand.ChaCha8
 	crc    hash.Hash32
 	remain int
 }
 
-// NewBigFileReader returns a fresh BigFileReader.
-func NewBigFileReader() *BigFileReader {
-	return &BigFileReader{
+// newBigFileReader returns a fresh reader for the canonical bigfile
+// fixture (bigFileSize bytes, deterministic). Use bigFileHashHex to
+// obtain the corresponding hash.
+func newBigFileReader() *bigFileReader {
+	return &bigFileReader{
 		src:    rand.NewChaCha8(bigFileSeed),
 		crc:    crc32.New(crc32.MakeTable(crc32.Castagnoli)),
-		remain: BigFileSize,
+		remain: bigFileSize,
 	}
 }
 
 // Read implements io.Reader.
-func (r *BigFileReader) Read(p []byte) (int, error) {
+func (r *bigFileReader) Read(p []byte) (int, error) {
 	if r.remain == 0 {
 		return 0, io.EOF
 	}
@@ -109,26 +110,25 @@ func (r *BigFileReader) Read(p []byte) (int, error) {
 	return nr, nil
 }
 
-// HashHex returns the crc32-Castagnoli (hex) of bytes produced so
-// far. Call after the reader is fully consumed to get the canonical
-// fixture hash.
-func (r *BigFileReader) HashHex() string {
+// hashHex returns the crc32-Castagnoli (hex) of bytes produced so
+// far. Call after the reader is fully consumed.
+func (r *bigFileReader) hashHex() string {
 	return fmt.Sprintf("%08x", r.crc.Sum32())
 }
 
-// BigFileHashHex returns the canonical crc32-Castagnoli of the
+// bigFileHashHex returns the canonical crc32-Castagnoli of the
 // fixture by streaming through io.Discard.
-func BigFileHashHex() string {
-	r := NewBigFileReader()
+func bigFileHashHex() string {
+	r := newBigFileReader()
 	_, _ = io.Copy(io.Discard, r)
-	return r.HashHex()
+	return r.hashHex()
 }
 
-// WriteBigFileErofs builds a separate erofs image containing the IO
+// writeBigFileErofs builds a separate erofs image containing the IO
 // benchmark fixture mounted at /data/bigfile and the stress stat
 // fixture at /data/stat/probe. Returns the image path; callers
 // compose it as an additional lower in the rootfs overlay.
-func WriteBigFileErofs(tb testing.TB) string {
+func writeBigFileErofs(tb testing.TB) string {
 	tb.Helper()
 
 	imgPath := filepath.Join(tb.TempDir(), "bigfile.erofs")
@@ -148,7 +148,7 @@ func WriteBigFileErofs(tb testing.TB) string {
 	if err != nil {
 		tb.Fatal("create bigfile entry:", err)
 	}
-	if _, err := io.Copy(bf, NewBigFileReader()); err != nil {
+	if _, err := io.Copy(bf, newBigFileReader()); err != nil {
 		tb.Fatal("write bigfile:", err)
 	}
 	if err := bf.Chmod(0644); err != nil {
@@ -183,10 +183,10 @@ func WriteBigFileErofs(tb testing.TB) string {
 	return imgPath
 }
 
-// WriteRootfsErofs builds an erofs image containing the testbin
+// writeRootfsErofs builds an erofs image containing the testbin
 // rootfs directly from the embedded binary, without touching the
 // local filesystem. Returns the path to the image file.
-func WriteRootfsErofs(tb testing.TB) string {
+func writeRootfsErofs(tb testing.TB) string {
 	tb.Helper()
 
 	imgPath := filepath.Join(tb.TempDir(), "rootfs.erofs")
@@ -208,7 +208,7 @@ func WriteRootfsErofs(tb testing.TB) string {
 	if err != nil {
 		tb.Fatal("create testbin:", err)
 	}
-	r, err := OpenTestbin()
+	r, err := openTestbin()
 	if err != nil {
 		tb.Fatal("open testbin:", err)
 	}
@@ -222,7 +222,7 @@ func WriteRootfsErofs(tb testing.TB) string {
 		tb.Fatal("close testbin:", err)
 	}
 
-	for _, cmd := range TestbinCommands {
+	for _, cmd := range testbinCommands {
 		if err := w.Symlink("testbin", "bin/"+cmd); err != nil {
 			tb.Fatal("symlink:", err)
 		}
@@ -256,9 +256,9 @@ func writeErofsFile(tb testing.TB, w *erofs.Writer, path string, data []byte) {
 	}
 }
 
-// ExtractErofsIntoDir opens an erofs image and copies its contents
+// extractErofsIntoDir opens an erofs image and copies its contents
 // into dir.
-func ExtractErofsIntoDir(tb testing.TB, imgPath, dir string) {
+func extractErofsIntoDir(tb testing.TB, imgPath, dir string) {
 	tb.Helper()
 
 	f, err := os.Open(imgPath)
@@ -322,50 +322,50 @@ func ExtractErofsIntoDir(tb testing.TB, imgPath, dir string) {
 	}
 }
 
-// ExtractErofsToDir extracts an erofs image into a new temp directory
+// extractErofsToDir extracts an erofs image into a new temp directory
 // and returns its path.
-func ExtractErofsToDir(tb testing.TB, imgPath string) string {
+func extractErofsToDir(tb testing.TB, imgPath string) string {
 	tb.Helper()
 	dir := filepath.Join(tb.TempDir(), "rootfs")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		tb.Fatal("mkdir:", err)
 	}
-	ExtractErofsIntoDir(tb, imgPath, dir)
+	extractErofsIntoDir(tb, imgPath, dir)
 	return dir
 }
 
-// BuildEmbeddedRootfs builds rootfs mounts from the embedded testbin
+// buildEmbeddedRootfs builds rootfs mounts from the embedded testbin
 // binary. When cfg.FormatMounts is set, the rootfs is provided as
 // erofs and ext4 images with a format/mkdir/overlay mount descriptor
 // for the shim to mount. When running as root, the rootfs is
 // extracted and provided as an overlay mount. When running as
 // non-root (rootless), the rootfs is extracted directly into the
 // bundle's rootfs directory with no mounts.
-func BuildEmbeddedRootfs(tb testing.TB, bundleDir string, cfg Config) []*types.Mount {
+func buildEmbeddedRootfs(tb testing.TB, bundleDir string, cfg Config) []*types.Mount {
 	tb.Helper()
 
-	erofsImg := WriteRootfsErofs(tb)
-	bigImg := WriteBigFileErofs(tb)
+	erofsImg := writeRootfsErofs(tb)
+	bigImg := writeBigFileErofs(tb)
 
 	if cfg.FormatMounts {
-		return BuildErofsMounts(tb, []string{erofsImg, bigImg})
+		return buildErofsMounts(tb, []string{erofsImg, bigImg})
 	}
 
 	if os.Getuid() != 0 {
 		rootfs := filepath.Join(bundleDir, "rootfs")
-		ExtractErofsIntoDir(tb, erofsImg, rootfs)
-		ExtractErofsIntoDir(tb, bigImg, rootfs)
+		extractErofsIntoDir(tb, erofsImg, rootfs)
+		extractErofsIntoDir(tb, bigImg, rootfs)
 		return nil
 	}
 
-	srcDir := ExtractErofsToDir(tb, erofsImg)
-	ExtractErofsIntoDir(tb, bigImg, srcDir)
-	return BuildOverlayMounts(tb, srcDir)
+	srcDir := extractErofsToDir(tb, erofsImg)
+	extractErofsIntoDir(tb, bigImg, srcDir)
+	return buildOverlayMounts(tb, srcDir)
 }
 
-// BuildOverlayMounts returns an overlay mount with lower (read-only
+// buildOverlayMounts returns an overlay mount with lower (read-only
 // rootfs), upper (writable), and work directories.
-func BuildOverlayMounts(tb testing.TB, lower string) []*types.Mount {
+func buildOverlayMounts(tb testing.TB, lower string) []*types.Mount {
 	tb.Helper()
 
 	dir := tb.TempDir()
@@ -390,10 +390,10 @@ func BuildOverlayMounts(tb testing.TB, lower string) []*types.Mount {
 	}}
 }
 
-// BuildErofsMounts builds the layered erofs layout: ext4 (rw scratch)
+// buildErofsMounts builds the layered erofs layout: ext4 (rw scratch)
 // + one or more erofs lowers + overlay. Lowers are stacked in order,
 // with erofsImgs[0] highest (matching overlay's lowerdir semantics).
-func BuildErofsMounts(tb testing.TB, erofsImgs []string) []*types.Mount {
+func buildErofsMounts(tb testing.TB, erofsImgs []string) []*types.Mount {
 	tb.Helper()
 
 	ext4Img := filepath.Join(tb.TempDir(), "scratch.ext4")

@@ -35,28 +35,28 @@ import (
 
 // UDSSuite contains the UDS-mount tests, gated on the "uds" feature.
 type UDSSuite struct {
-	cfg   Config
-	setup ShimSetupFunc
+	cfg Config
+	
 }
 
 // NewUDSSuite constructs a UDSSuite from the given options.
-func NewUDSSuite(opts SuiteOptions) *UDSSuite {
-	return &UDSSuite{cfg: opts.Config, setup: opts.resolveSetup()}
+func NewUDSSuite(cfg Config) *UDSSuite {
+	return &UDSSuite{cfg: cfg}
 }
 
 // Run runs every test in the suite as a subtest of t. The subtest
 // name is kept as UDSRoundTrip to match historical -test.run filters.
 func (s *UDSSuite) Run(t *testing.T) {
 	t.Helper()
-	t.Run("UDSRoundTrip", s.TestRoundTrip)
+	t.Run("UDSRoundTrip", s.testRoundTrip)
 }
 
 // TestRoundTrip verifies that a container can connect to a host-side
 // unix domain socket via the UDS mount type, and that data flows
 // bidirectionally.
-func (s *UDSSuite) TestRoundTrip(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *UDSSuite) testRoundTrip(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
 	hostSockDir, err := os.MkdirTemp("/tmp", "nb-uds-")
 	if err != nil {
@@ -72,28 +72,28 @@ func (s *UDSSuite) TestRoundTrip(t *testing.T) {
 
 	const containerSockPath = "/run/test.sock"
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg,
-		WithExtraMounts(specs.Mount{
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg,
+		withExtraMounts(specs.Mount{
 			Type:        "uds",
 			Source:      hostSockPath,
 			Destination: containerSockPath,
 		}),
 	)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -102,12 +102,12 @@ func (s *UDSSuite) TestRoundTrip(t *testing.T) {
 
 	execID := "uds-rt"
 	execDir := t.TempDir()
-	_, execStdout, execStderr := CreateStdioFifos(t, execDir)
+	_, execStdout, execStderr := createStdioFifos(t, execDir)
 
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 		Args: []string{"/bin/nc", "-U", containerSockPath},
@@ -137,7 +137,7 @@ func (s *UDSSuite) TestRoundTrip(t *testing.T) {
 	}
 	defer hostConn.Close()
 
-	token := RandomSuffix() + "\n"
+	token := randomSuffix() + "\n"
 	if _, err := hostConn.Write([]byte(token)); err != nil {
 		t.Fatal("host write:", err)
 	}

@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package shimtest
+package shimtest_test
 
 import (
 	"encoding/json"
@@ -30,6 +30,8 @@ import (
 
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/dmcgowan/shimtest"
 )
 
 // runConfig is the JSON-driven configuration used by this package's
@@ -37,7 +39,7 @@ import (
 // only meaningful to the local CLI flow (skip list, uid/gid for
 // re-exec).
 type runConfig struct {
-	Config
+	shimtest.Config
 
 	// Skip is a list of feature names whose suite the local runner
 	// should not invoke. Recognized values: "exec", "transfer",
@@ -78,7 +80,7 @@ func (c *runConfig) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
-	c.Config = Config{
+	c.Config = shimtest.Config{
 		ShimBinary:   j.ShimBinary,
 		FormatMounts: j.FormatMounts,
 		Env:          j.Env,
@@ -210,7 +212,7 @@ func discoverConfigs() map[string]runConfig {
 
 	if len(configs) == 0 {
 		if v := os.Getenv("SHIM_BINARY"); v != "" {
-			configs["default"] = runConfig{Config: Config{ShimBinary: v}}
+			configs["default"] = runConfig{Config: shimtest.Config{ShimBinary: v}}
 		}
 	}
 

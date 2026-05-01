@@ -40,40 +40,40 @@ import (
 // event-stream verification. None of these tests are gated by a
 // feature key — every shim should pass them.
 type RunSuite struct {
-	cfg   Config
-	setup ShimSetupFunc
+	cfg Config
+	
 }
 
 // NewRunSuite constructs a RunSuite from the given options.
-func NewRunSuite(opts SuiteOptions) *RunSuite {
-	return &RunSuite{cfg: opts.Config, setup: opts.resolveSetup()}
+func NewRunSuite(cfg Config) *RunSuite {
+	return &RunSuite{cfg: cfg}
 }
 
 // Run runs every test in the suite as a subtest of t.
 func (s *RunSuite) Run(t *testing.T) {
 	t.Helper()
-	t.Run("Lifecycle", s.TestLifecycle)
-	t.Run("InitExitCodes", s.TestInitExitCodes)
-	t.Run("OutputThenExit", s.TestOutputThenExit)
-	t.Run("Events", s.TestEvents)
+	t.Run("Lifecycle", s.testLifecycle)
+	t.Run("InitExitCodes", s.testInitExitCodes)
+	t.Run("OutputThenExit", s.testOutputThenExit)
+	t.Run("Events", s.testEvents)
 }
 
-// TestLifecycle drives a container through create / start / state /
+// testLifecycle drives a container through create / start / state /
 // kill / wait / delete / shutdown and verifies output appears.
-func (s *RunSuite) TestLifecycle(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
+func (s *RunSuite) testLifecycle(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	t.Log("shim binary:", shimBin)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever", "hello"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/forever", "hello"}, s.cfg)
 
-	containerID := ContainerID(t)
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	containerID := containerID(t)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
 	t.Log("shim started, address:", params.Address)
 
-	conn := ConnectShim(t, params.Address)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
@@ -108,7 +108,7 @@ func (s *RunSuite) TestLifecycle(t *testing.T) {
 	}()
 
 	t.Log("creating task")
-	createResp, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts))
+	createResp, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts))
 	if err != nil {
 		t.Fatal("failed to create task:", err)
 	}
@@ -177,30 +177,30 @@ func (s *RunSuite) TestLifecycle(t *testing.T) {
 	}
 }
 
-// TestInitExitCodes runs /bin/exit N as the container's init for a
+// testInitExitCodes runs /bin/exit N as the container's init for a
 // range of values and verifies the task-level exit status.
-func (s *RunSuite) TestInitExitCodes(t *testing.T) {
+func (s *RunSuite) testInitExitCodes(t *testing.T) {
 	for _, code := range []int{0, 1, 2, 42, 127, 255} {
 		t.Run(fmt.Sprintf("Exit%d", code), func(t *testing.T) {
-			shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-			cid := ContainerID(t)
+			shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+			cid := containerID(t)
 
-			CreateOCISpecCfg(t, bundleDir, []string{"/bin/exit", strconv.Itoa(code)}, s.cfg)
+			createOCISpec(t, bundleDir, []string{"/bin/exit", strconv.Itoa(code)}, s.cfg)
 
-			stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-			ctx := namespaces.WithNamespace(t.Context(), Namespace)
+			stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+			ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-			params := StartShim(t, shimBin, bundleDir, cid, Namespace, s.cfg)
-			conn := ConnectShim(t, params.Address)
+			params := startShim(t, shimBin, bundleDir, cid, shimtestNamespace, s.cfg)
+			conn := connectShim(t, params.Address)
 			client := ttrpc.NewClient(conn)
 			defer client.Close()
 
 			tc := taskAPI.NewTTRPCTaskClient(client)
 
-			DrainFifo(t, ctx, stdoutPath)
-			DrainFifo(t, ctx, stderrPath)
+			drainFifo(t, ctx, stdoutPath)
+			drainFifo(t, ctx, stderrPath)
 
-			if _, err := tc.Create(ctx, NewCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+			if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 				t.Fatal("create failed:", err)
 			}
 			if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
@@ -221,20 +221,20 @@ func (s *RunSuite) TestInitExitCodes(t *testing.T) {
 	}
 }
 
-// TestOutputThenExit runs a process that writes 50 lines then exits
+// testOutputThenExit runs a process that writes 50 lines then exits
 // non-zero, and verifies both the exit status and every output line
 // are captured by the shim.
-func (s *RunSuite) TestOutputThenExit(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *RunSuite) testOutputThenExit(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/tickexit"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/tickexit"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
@@ -242,10 +242,10 @@ func (s *RunSuite) TestOutputThenExit(t *testing.T) {
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
-	DrainFifoInto(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifoInto(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -299,32 +299,32 @@ func (s *RunSuite) TestOutputThenExit(t *testing.T) {
 	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
 }
 
-// TestEvents verifies that the shim publishes the expected task
+// testEvents verifies that the shim publishes the expected task
 // lifecycle events (create, start, exit, delete) to its containerd
 // events endpoint during a normal run.
-func (s *RunSuite) TestEvents(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
-	ns := Namespace
+func (s *RunSuite) testEvents(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+	ns := shimtestNamespace
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/exit", "0"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/exit", "0"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
 	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	rec := StartEventsRecorder(t, bundleDir)
+	rec := startEventsRecorder(t, bundleDir)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -335,8 +335,8 @@ func (s *RunSuite) TestEvents(t *testing.T) {
 		t.Fatal("wait failed:", err)
 	}
 
-	if rec.WaitForTopic("/tasks/exit", 2*time.Second) == nil {
-		t.Fatalf("exit event not published after task wait; received topics: %v", rec.Topics())
+	if rec.waitForTopic("/tasks/exit", 2*time.Second) == nil {
+		t.Fatalf("exit event not published after task wait; received topics: %v", rec.topics())
 	}
 
 	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID}); err != nil {
@@ -351,12 +351,12 @@ func (s *RunSuite) TestEvents(t *testing.T) {
 		"/tasks/delete",
 	}
 	for _, topic := range want {
-		if env := rec.WaitForTopic(topic, 2*time.Second); env == nil {
-			t.Fatalf("missing event %q; received topics: %v", topic, rec.Topics())
+		if env := rec.waitForTopic(topic, 2*time.Second); env == nil {
+			t.Fatalf("missing event %q; received topics: %v", topic, rec.topics())
 		}
 	}
 
-	got := rec.Topics()
+	got := rec.topics()
 	t.Log("received topics:", got)
 	idx := 0
 	for _, topic := range got {
@@ -368,7 +368,7 @@ func (s *RunSuite) TestEvents(t *testing.T) {
 		t.Fatalf("events out of order or missing: want (in order) %v, got %v", want, got)
 	}
 
-	exitEnv := rec.WaitForTopic("/tasks/exit", 0)
+	exitEnv := rec.waitForTopic("/tasks/exit", 0)
 	if exitEnv == nil {
 		t.Fatal("exit envelope vanished")
 	}

@@ -29,34 +29,25 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// EventRecorder implements the containerd ttrpc events service and
+// eventRecorder implements the containerd ttrpc events service and
 // records every envelope it receives. Shims push events to this
 // endpoint (the TTRPC_ADDRESS the shim reads from its environment);
 // tests can then assert on topic order, contents, and timing.
-type EventRecorder struct {
+type eventRecorder struct {
 	mu        sync.Mutex
 	envelopes []*types.Envelope
 }
 
 // Forward implements the eventsapi.TTRPCEventsService.Forward method.
-func (r *EventRecorder) Forward(_ context.Context, req *eventsapi.ForwardRequest) (*emptypb.Empty, error) {
+func (r *eventRecorder) Forward(_ context.Context, req *eventsapi.ForwardRequest) (*emptypb.Empty, error) {
 	r.mu.Lock()
 	r.envelopes = append(r.envelopes, req.Envelope)
 	r.mu.Unlock()
 	return &emptypb.Empty{}, nil
 }
 
-// All returns a snapshot of every envelope recorded so far.
-func (r *EventRecorder) All() []*types.Envelope {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]*types.Envelope, len(r.envelopes))
-	copy(out, r.envelopes)
-	return out
-}
-
-// Topics returns the ordered topic strings recorded so far.
-func (r *EventRecorder) Topics() []string {
+// topics returns the ordered topic strings recorded so far.
+func (r *eventRecorder) topics() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]string, len(r.envelopes))
@@ -66,9 +57,9 @@ func (r *EventRecorder) Topics() []string {
 	return out
 }
 
-// WaitForTopic polls until an envelope with the given topic is
+// waitForTopic polls until an envelope with the given topic is
 // recorded, or the timeout expires. Returns nil on timeout.
-func (r *EventRecorder) WaitForTopic(topic string, timeout time.Duration) *types.Envelope {
+func (r *eventRecorder) waitForTopic(topic string, timeout time.Duration) *types.Envelope {
 	deadline := time.Now().Add(timeout)
 	for {
 		r.mu.Lock()
@@ -86,14 +77,14 @@ func (r *EventRecorder) WaitForTopic(topic string, timeout time.Duration) *types
 	}
 }
 
-// StartEventsRecorder binds a TTRPC events server to the socket path
+// startEventsRecorder binds a TTRPC events server to the socket path
 // the shim dials as its events endpoint (bundleDir/c.sock) and
 // returns a recorder capturing every forwarded envelope. Must be
-// called before StartShim so the shim's first publish succeeds.
-func StartEventsRecorder(tb testing.TB, bundleDir string) *EventRecorder {
+// called before startShim so the shim's first publish succeeds.
+func startEventsRecorder(tb testing.TB, bundleDir string) *eventRecorder {
 	tb.Helper()
 
-	socketPath := ContainerdSockPath(tb, bundleDir)
+	socketPath := containerdSockPath(tb, bundleDir)
 
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -106,7 +97,7 @@ func StartEventsRecorder(tb testing.TB, bundleDir string) *EventRecorder {
 		tb.Fatal("events server:", err)
 	}
 
-	rec := &EventRecorder{}
+	rec := &eventRecorder{}
 	eventsapi.RegisterTTRPCEventsService(srv, rec)
 
 	go srv.Serve(context.Background(), ln)

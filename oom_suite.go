@@ -29,45 +29,45 @@ import (
 // (some shim configurations don't expose memory cgroup controls or
 // can't reliably trigger the kernel OOM killer).
 type OOMSuite struct {
-	cfg   Config
-	setup ShimSetupFunc
+	cfg Config
+	
 }
 
 // NewOOMSuite constructs an OOMSuite from the given options.
-func NewOOMSuite(opts SuiteOptions) *OOMSuite {
-	return &OOMSuite{cfg: opts.Config, setup: opts.resolveSetup()}
+func NewOOMSuite(cfg Config) *OOMSuite {
+	return &OOMSuite{cfg: cfg}
 }
 
 // Run runs every test in the suite as a subtest of t.
 func (s *OOMSuite) Run(t *testing.T) {
 	t.Helper()
-	t.Run("OOM", s.TestOOM)
+	t.Run("OOM", s.testOOM)
 }
 
 // TestOOM runs a memory-hungry process inside a container with a
 // 128MiB memory limit and verifies the kernel OOM-kills it (exit 137).
-func (s *OOMSuite) TestOOM(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *OOMSuite) testOOM(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/memhog"}, s.cfg,
-		WithMemoryLimit(128*1024*1024),
+	createOCISpec(t, bundleDir, []string{"/bin/memhog"}, s.cfg,
+		withMemoryLimit(128*1024*1024),
 	)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {

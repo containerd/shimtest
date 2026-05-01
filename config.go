@@ -17,35 +17,27 @@
 // Package shimtest is a conformance test suite for containerd shim
 // implementations. The tests are organized into Suites — RunSuite,
 // ExecSuite, TransferSuite, UDSSuite, OOMSuite — each gated against
-// one feature key. Callers construct a Config + SuiteOptions and call
-// the suite's Run method (or individual Test methods) from their own
-// test functions:
+// one feature key. Callers construct a Config and call the suite's
+// Run method (or Bench / Fuzz) from their own test functions:
 //
 //	func TestMyShim(t *testing.T) {
-//	    opts := shimtest.SuiteOptions{
-//	        Config: shimtest.Config{ShimBinary: "containerd-shim-myshim-v1"},
-//	    }
-//	    shimtest.NewRunSuite(opts).Run(t)
-//	    shimtest.NewExecSuite(opts).Run(t)
+//	    cfg := shimtest.Config{ShimBinary: "containerd-shim-myshim-v1"}
+//	    shimtest.NewRunSuite(cfg).Run(t)
+//	    shimtest.NewExecSuite(cfg).Run(t)
 //	}
-//
-// The shim setup happens via a SetupFunc on SuiteOptions; if nil, the
-// default flow (start shim, create+start container) is used.
 package shimtest
 
-import (
-	"context"
-	"testing"
-)
-
-// Namespace is the containerd namespace used for all shimtest
+// shimtestNamespace is the containerd namespace used for all shimtest
 // operations.
-const Namespace = "shimtest"
+const shimtestNamespace = "shimtest"
 
-// Config is the suite-level configuration. It carries everything a
-// suite needs to bring up a shim. There is no Skip field — choosing
-// which suites to run is the caller's concern (skip a feature by not
-// constructing the corresponding suite).
+// Config carries everything a suite needs to bring up a shim.
+// Callers identify their shim and tune setup behavior via this
+// struct; suites hold a copy and use it for every test they run.
+//
+// Config has no Skip field — choosing which suites to run is the
+// caller's concern (skip a feature by not constructing the
+// corresponding suite).
 type Config struct {
 	// ShimBinary is the name (resolved via PATH) or absolute path of
 	// the shim binary under test.
@@ -67,30 +59,4 @@ type Config struct {
 
 	// Debug enables verbose logging from the shim.
 	Debug bool
-}
-
-// ShimSetupFunc brings up a shim and a running container for a single
-// test. The returned ShimEnv is ready for task-API and transfer-API
-// calls. The implementation must register cleanup via tb.Cleanup so
-// the shim, container, and supporting resources are torn down after
-// the test.
-type ShimSetupFunc func(tb testing.TB, ctx context.Context) *ShimEnv
-
-// SuiteOptions is the argument to every NewXxxSuite constructor.
-type SuiteOptions struct {
-	// Config is the shim configuration. Required.
-	Config Config
-
-	// Setup is the per-test shim/container bring-up. Optional; when
-	// nil DefaultSetup(Config) is used.
-	Setup ShimSetupFunc
-}
-
-// resolveSetup returns opts.Setup or DefaultSetup(opts.Config) when
-// the caller didn't supply one.
-func (o SuiteOptions) resolveSetup() ShimSetupFunc {
-	if o.Setup != nil {
-		return o.Setup
-	}
-	return DefaultSetup(o.Config)
 }

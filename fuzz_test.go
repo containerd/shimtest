@@ -14,11 +14,13 @@
    limitations under the License.
 */
 
-package shimtest
+package shimtest_test
 
 import (
 	"sort"
 	"testing"
+
+	"github.com/dmcgowan/shimtest"
 )
 
 // FuzzTransferMissing is the local JSON-driven entry point that
@@ -40,7 +42,7 @@ func FuzzTransferMissing(f *testing.F) {
 		f.Skip("feature \"transfer\" disabled in config")
 	}
 
-	NewTransferSuite(SuiteOptions{Config: cfg.Config}).Fuzz(f)
+	shimtest.NewTransferSuite(cfg.Config).Fuzz(f)
 }
 
 // pickFuzzConfig returns the alphabetically-first configuration.

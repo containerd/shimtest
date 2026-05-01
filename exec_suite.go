@@ -42,48 +42,48 @@ import (
 // exec exit-code propagation, and file-IO benchmarks driven via
 // hashverify.
 type ExecSuite struct {
-	cfg   Config
-	setup ShimSetupFunc
+	cfg Config
+	
 }
 
 // NewExecSuite constructs an ExecSuite from the given options.
-func NewExecSuite(opts SuiteOptions) *ExecSuite {
-	return &ExecSuite{cfg: opts.Config, setup: opts.resolveSetup()}
+func NewExecSuite(cfg Config) *ExecSuite {
+	return &ExecSuite{cfg: cfg}
 }
 
 // Run runs every test in the suite as a subtest of t.
 func (s *ExecSuite) Run(t *testing.T) {
 	t.Helper()
-	t.Run("Exec", s.TestExec)
-	t.Run("StdioRoundTrip", s.TestStdioRoundTrip)
-	t.Run("Clock", s.TestClock)
-	t.Run("ExitCodes", s.TestExitCodes)
-	t.Run("LargeFileRead", s.TestLargeFileRead)
-	t.Run("BindMountRead", s.TestBindMountRead)
+	t.Run("Exec", s.testExec)
+	t.Run("StdioRoundTrip", s.testStdioRoundTrip)
+	t.Run("Clock", s.testClock)
+	t.Run("ExitCodes", s.testExitCodes)
+	t.Run("LargeFileRead", s.testLargeFileRead)
+	t.Run("BindMountRead", s.testBindMountRead)
 }
 
 // TestExec runs `echo execworks` inside a container and verifies the
 // stdout makes it back through the shim.
-func (s *ExecSuite) TestExec(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *ExecSuite) testExec(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -91,12 +91,12 @@ func (s *ExecSuite) TestExec(t *testing.T) {
 	}
 
 	execID := "exec1"
-	execStdout, execStderr := CreateIOFifos(t, t.TempDir())
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
 
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 		Args: []string{"/bin/echo", "execworks"},
@@ -150,26 +150,26 @@ func (s *ExecSuite) TestExec(t *testing.T) {
 
 // TestStdioRoundTrip writes a token to stdin of an exec'd `cat` and
 // verifies the same token is read back from stdout.
-func (s *ExecSuite) TestStdioRoundTrip(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *ExecSuite) testStdioRoundTrip(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -178,12 +178,12 @@ func (s *ExecSuite) TestStdioRoundTrip(t *testing.T) {
 
 	execID := "stdio-rt"
 	execDir := t.TempDir()
-	execStdin, execStdout, execStderr := CreateStdioFifos(t, execDir)
+	execStdin, execStdout, execStderr := createStdioFifos(t, execDir)
 
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	stdinFifo, err := fifo.OpenFifo(ctx, execStdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -214,7 +214,7 @@ func (s *ExecSuite) TestStdioRoundTrip(t *testing.T) {
 		t.Fatal("exec start failed:", err)
 	}
 
-	token := RandomSuffix() + "\n"
+	token := randomSuffix() + "\n"
 	if _, err := stdinFifo.Write([]byte(token)); err != nil {
 		t.Fatal("write to stdin:", err)
 	}
@@ -248,26 +248,26 @@ func (s *ExecSuite) TestStdioRoundTrip(t *testing.T) {
 // TestClock verifies the in-container clock matches the host's
 // (within a tolerance) by running `date +%s` and bracketing it with
 // host timestamps.
-func (s *ExecSuite) TestClock(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *ExecSuite) testClock(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -275,12 +275,12 @@ func (s *ExecSuite) TestClock(t *testing.T) {
 	}
 
 	execID := "clock1"
-	execStdout, execStderr := CreateIOFifos(t, t.TempDir())
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
 
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 		Args: []string{"/bin/date", "+%s"},
@@ -349,26 +349,26 @@ func (s *ExecSuite) TestClock(t *testing.T) {
 
 // TestExitCodes runs /bin/exit N inside a container via exec for a
 // range of values and verifies each is propagated back via Wait.
-func (s *ExecSuite) TestExitCodes(t *testing.T) {
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	containerID := ContainerID(t)
+func (s *ExecSuite) testExitCodes(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
 
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, containerID, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
@@ -378,9 +378,9 @@ func (s *ExecSuite) TestExitCodes(t *testing.T) {
 	for i, code := range []int{0, 1, 2, 42, 127, 255} {
 		t.Run(fmt.Sprintf("Exit%d", code), func(t *testing.T) {
 			execID := fmt.Sprintf("exit-%d", i)
-			execStdout, execStderr := CreateIOFifos(t, t.TempDir())
-			DrainFifo(t, ctx, execStdout)
-			DrainFifo(t, ctx, execStderr)
+			execStdout, execStderr := createIOFifos(t, t.TempDir())
+			drainFifo(t, ctx, execStdout)
+			drainFifo(t, ctx, execStderr)
 
 			procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 				Args: []string{"/bin/exit", strconv.Itoa(code)},
@@ -426,20 +426,20 @@ func (s *ExecSuite) TestExitCodes(t *testing.T) {
 // TestLargeFileRead reads /data/bigfile (a 64 MiB fixture from the
 // secondary read-only erofs layer) inside the container, verifies
 // its crc32-Castagnoli, and reports throughput.
-func (s *ExecSuite) TestLargeFileRead(t *testing.T) {
-	s.runHashverify(t, BigFileContainerPath, BigFileHashHex(), nil)
+func (s *ExecSuite) testLargeFileRead(t *testing.T) {
+	s.runHashverify(t, bigFileContainerPath, bigFileHashHex(), nil)
 }
 
 // TestBindMountRead streams the same 64 MiB fixture into a host
 // tempfile, bind-mounts it into the container, and runs hashverify
 // against the bind path.
-func (s *ExecSuite) TestBindMountRead(t *testing.T) {
+func (s *ExecSuite) testBindMountRead(t *testing.T) {
 	hostFile := filepath.Join(t.TempDir(), "bigfile")
 	f, err := os.Create(hostFile)
 	if err != nil {
 		t.Fatal("create host bigfile:", err)
 	}
-	if _, err := io.Copy(f, NewBigFileReader()); err != nil {
+	if _, err := io.Copy(f, newBigFileReader()); err != nil {
 		f.Close()
 		t.Fatal("write host bigfile:", err)
 	}
@@ -454,7 +454,7 @@ func (s *ExecSuite) TestBindMountRead(t *testing.T) {
 		Destination: containerPath,
 		Options:     []string{"rbind"},
 	}
-	s.runHashverify(t, containerPath, BigFileHashHex(), []specs.Mount{mount})
+	s.runHashverify(t, containerPath, bigFileHashHex(), []specs.Mount{mount})
 }
 
 // runHashverify spins up a container with the given extra mounts,
@@ -463,29 +463,29 @@ func (s *ExecSuite) TestBindMountRead(t *testing.T) {
 // via t.Log.
 func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMounts []specs.Mount) {
 	t.Helper()
-	shimBin, bundleDir, rootfsMounts := ShimSetup(t, s.cfg)
-	cid := ContainerID(t)
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	cid := containerID(t)
 
 	var opts []func(*specs.Spec)
 	if len(extraMounts) > 0 {
-		opts = append(opts, WithExtraMounts(extraMounts...))
+		opts = append(opts, withExtraMounts(extraMounts...))
 	}
-	CreateOCISpecCfg(t, bundleDir, []string{"/bin/forever"}, s.cfg, opts...)
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg, opts...)
 
-	stdoutPath, stderrPath := CreateIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), Namespace)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
 
-	params := StartShim(t, shimBin, bundleDir, cid, Namespace, s.cfg)
-	conn := ConnectShim(t, params.Address)
+	params := startShim(t, shimBin, bundleDir, cid, shimtestNamespace, s.cfg)
+	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
 
-	DrainFifo(t, ctx, stdoutPath)
-	DrainFifo(t, ctx, stderrPath)
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
 
-	if _, err := tc.Create(ctx, NewCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
@@ -493,11 +493,11 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 	}
 
 	execID := "hashv"
-	execStdout, execStderr := CreateIOFifos(t, t.TempDir())
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 		Args: []string{"/bin/hashverify", path, hashHex},

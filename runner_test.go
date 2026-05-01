@@ -14,11 +14,13 @@
    limitations under the License.
 */
 
-package shimtest
+package shimtest_test
 
 import (
 	"sort"
 	"testing"
+
+	"github.com/dmcgowan/shimtest"
 )
 
 // TestShim is the local JSON-driven runner. For each configured
@@ -37,28 +39,29 @@ func TestShim(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			activateConfig(cfg)
-			opts := SuiteOptions{Config: cfg.Config}
+			c := cfg.Config
 
-			NewRunSuite(opts).Run(t)
+			shimtest.NewRunSuite(c).Run(t)
 			if !featureSkipped("exec") {
-				NewExecSuite(opts).Run(t)
+				shimtest.NewExecSuite(c).Run(t)
 			}
 			if !featureSkipped("transfer") {
-				NewTransferSuite(opts).Run(t)
+				shimtest.NewTransferSuite(c).Run(t)
 			}
 			if !featureSkipped("uds") {
-				NewUDSSuite(opts).Run(t)
+				shimtest.NewUDSSuite(c).Run(t)
 			}
 			if !featureSkipped("oom") {
-				NewOOMSuite(opts).Run(t)
+				shimtest.NewOOMSuite(c).Run(t)
 			}
 		})
 	}
 }
 
-// BenchmarkShim is the top-level benchmark runner. Benchmarks are
-// not yet migrated to suites — they continue to use the package-
-// internal helpers and run directly.
+// BenchmarkShim is the top-level benchmark runner. For each
+// configured profile it activates the config, then dispatches to
+// each suite that has benchmarks (RunSuite, ExecSuite, UDSSuite),
+// gated on the same Skip list as TestShim.
 func BenchmarkShim(b *testing.B) {
 	for _, name := range sortedConfigNames() {
 		cfg := testConfigs[name]
@@ -68,15 +71,15 @@ func BenchmarkShim(b *testing.B) {
 		}
 		b.Run(name, func(b *testing.B) {
 			activateConfig(cfg)
-			b.Run("Lifecycle", benchmarkShimLifecycle)
-			b.Run("Startup", benchmarkShimStartup)
-			b.Run("StartupPhases", benchmarkShimStartupPhases)
-			b.Run("Start", benchmarkShimStart)
-			b.Run("Exec", benchmarkShimExec)
-			b.Run("StdioRoundTrip", benchmarkShimStdioRoundTrip)
-			b.Run("ReadLargeFile", benchmarkShimReadLargeFile)
-			b.Run("ReadBindMount", benchmarkShimReadBindMount)
-			b.Run("UDSRoundTrip", benchmarkShimUDSRoundTrip)
+			c := cfg.Config
+
+			shimtest.NewRunSuite(c).Bench(b)
+			if !featureSkipped("exec") {
+				shimtest.NewExecSuite(c).Bench(b)
+			}
+			if !featureSkipped("uds") {
+				shimtest.NewUDSSuite(c).Bench(b)
+			}
 		})
 	}
 }

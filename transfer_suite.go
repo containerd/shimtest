@@ -42,13 +42,13 @@ import (
 // stress test, and a Fuzz target that callers can wire into a
 // top-level FuzzXxx in their own _test.go.
 type TransferSuite struct {
-	cfg   Config
-	setup ShimSetupFunc
+	cfg Config
+	
 }
 
 // NewTransferSuite constructs a TransferSuite from the given options.
-func NewTransferSuite(opts SuiteOptions) *TransferSuite {
-	return &TransferSuite{cfg: opts.Config, setup: opts.resolveSetup()}
+func NewTransferSuite(cfg Config) *TransferSuite {
+	return &TransferSuite{cfg: cfg}
 }
 
 // Run runs every test in the suite as a subtest of t. Subtest names
@@ -57,61 +57,61 @@ func NewTransferSuite(opts SuiteOptions) *TransferSuite {
 // workflow patterns keep matching.
 func (s *TransferSuite) Run(t *testing.T) {
 	t.Helper()
-	t.Run("TransferCopyTo", s.TestCopyTo)
-	t.Run("TransferCopyToAndFrom", s.TestCopyToAndFrom)
-	t.Run("TransferExecVerify", s.TestExecVerify)
-	t.Run("Stress", s.TestStress)
+	t.Run("TransferCopyTo", s.testCopyTo)
+	t.Run("TransferCopyToAndFrom", s.testCopyToAndFrom)
+	t.Run("TransferExecVerify", s.testExecVerify)
+	t.Run("Stress", s.testStress)
 }
 
 // TestCopyTo copies a small file into a running container via the
 // transfer service.
-func (s *TransferSuite) TestCopyTo(t *testing.T) {
-	env := s.setup(t, t.Context())
+func (s *TransferSuite) testCopyTo(t *testing.T) {
+	env := newShimEnv(t, t.Context(), s.cfg)
 	const testContent = "transfer-test-data-12345\n"
 
-	copyToContainer(t, env.Ctx, env, testContent, "/tmp")
+	copyToContainer(t, env.ctx, env, testContent, "/tmp")
 	t.Log("copy-to succeeded")
 
-	ShutdownShim(t, env.Ctx, env)
+	shutdownShim(t, env.ctx, env)
 }
 
 // TestCopyToAndFrom copies a file in then back out and verifies the
 // content matches.
-func (s *TransferSuite) TestCopyToAndFrom(t *testing.T) {
-	env := s.setup(t, t.Context())
+func (s *TransferSuite) testCopyToAndFrom(t *testing.T) {
+	env := newShimEnv(t, t.Context(), s.cfg)
 	const testContent = "transfer-test-data-12345\n"
 
-	copyToContainer(t, env.Ctx, env, testContent, "/tmp")
+	copyToContainer(t, env.ctx, env, testContent, "/tmp")
 	t.Log("copy-to succeeded")
 
-	received := copyFromContainer(t, env.Ctx, env, "/tmp/transferred.txt")
+	received := copyFromContainer(t, env.ctx, env, "/tmp/transferred.txt")
 	if received != testContent {
 		t.Fatalf("copy-from content mismatch: got %q, want %q", received, testContent)
 	}
 	t.Log("copy-from verified, content:", strings.TrimSpace(received))
 
-	ShutdownShim(t, env.Ctx, env)
+	shutdownShim(t, env.ctx, env)
 }
 
 // TestExecVerify copies a file in and verifies it via /bin/cat exec.
-func (s *TransferSuite) TestExecVerify(t *testing.T) {
-	env := s.setup(t, t.Context())
+func (s *TransferSuite) testExecVerify(t *testing.T) {
+	env := newShimEnv(t, t.Context(), s.cfg)
 	const testContent = "transfer-test-data-12345\n"
 
-	copyToContainer(t, env.Ctx, env, testContent, "/tmp")
+	copyToContainer(t, env.ctx, env, testContent, "/tmp")
 
-	execOutput := shimExec(t, env.Ctx, env, "verify", []string{"/bin/cat", "/tmp/transferred.txt"})
+	execOutput := shimExec(t, env.ctx, env, "verify", []string{"/bin/cat", "/tmp/transferred.txt"})
 	if !strings.Contains(execOutput, strings.TrimRight(testContent, "\n")) {
 		t.Fatalf("exec output %q does not contain expected content %q", execOutput, testContent)
 	}
 	t.Log("copy-to verified via exec:", strings.TrimSpace(execOutput))
 
-	ShutdownShim(t, env.Ctx, env)
+	shutdownShim(t, env.ctx, env)
 }
 
 // copyToContainer transfers content as a tar archive into the
 // container at the given path using the transfer service.
-func copyToContainer(t *testing.T, ctx context.Context, env *ShimEnv, content, path string) {
+func copyToContainer(t *testing.T, ctx context.Context, env *shimEnv, content, path string) {
 	t.Helper()
 
 	var tarBuf bytes.Buffer
@@ -132,20 +132,20 @@ func copyToContainer(t *testing.T, ctx context.Context, env *ShimEnv, content, p
 
 	src := transfer.NewReadStream(&tarBuf, "application/x-tar")
 	dst := &transfer.ContainerPath{
-		ContainerID: env.ContainerID,
+		ContainerID: env.containerID,
 		Path:        path,
 	}
 
-	srcAny, err := marshalTransferAny(ctx, src, env.SC)
+	srcAny, err := marshalTransferAny(ctx, src, env.sc)
 	if err != nil {
 		t.Fatal("failed to marshal source:", err)
 	}
-	dstAny, err := marshalTransferAny(ctx, dst, env.SC)
+	dstAny, err := marshalTransferAny(ctx, dst, env.sc)
 	if err != nil {
 		t.Fatal("failed to marshal destination:", err)
 	}
 
-	tfClient := transferapi.NewTTRPCTransferClient(env.Client)
+	tfClient := transferapi.NewTTRPCTransferClient(env.client)
 	if _, err := tfClient.Transfer(ctx, &transferapi.TransferRequest{
 		Source:      srcAny,
 		Destination: dstAny,
@@ -156,27 +156,27 @@ func copyToContainer(t *testing.T, ctx context.Context, env *ShimEnv, content, p
 
 // copyFromContainer reads a file from the container via the transfer
 // service and returns its content.
-func copyFromContainer(t *testing.T, ctx context.Context, env *ShimEnv, path string) string {
+func copyFromContainer(t *testing.T, ctx context.Context, env *shimEnv, path string) string {
 	t.Helper()
 
 	src := &transfer.ContainerPath{
-		ContainerID: env.ContainerID,
+		ContainerID: env.containerID,
 		Path:        path,
 	}
 
 	var received bytes.Buffer
 	dst := transfer.NewWriteStream(&nopWriteCloser{&received}, "application/x-tar")
 
-	srcAny, err := marshalTransferAny(ctx, src, env.SC)
+	srcAny, err := marshalTransferAny(ctx, src, env.sc)
 	if err != nil {
 		t.Fatal("failed to marshal source:", err)
 	}
-	dstAny, err := marshalTransferAny(ctx, dst, env.SC)
+	dstAny, err := marshalTransferAny(ctx, dst, env.sc)
 	if err != nil {
 		t.Fatal("failed to marshal destination:", err)
 	}
 
-	tfClient := transferapi.NewTTRPCTransferClient(env.Client)
+	tfClient := transferapi.NewTTRPCTransferClient(env.client)
 	if _, err := tfClient.Transfer(ctx, &transferapi.TransferRequest{
 		Source:      srcAny,
 		Destination: dstAny,
@@ -208,15 +208,15 @@ func copyFromContainer(t *testing.T, ctx context.Context, env *ShimEnv, path str
 
 // shimExec runs a process inside the container via the Exec API and
 // returns its stdout output.
-func shimExec(t *testing.T, ctx context.Context, env *ShimEnv, execID string, args []string) string {
+func shimExec(t *testing.T, ctx context.Context, env *shimEnv, execID string, args []string) string {
 	t.Helper()
 
-	execStdout, execStderr := CreateIOFifos(t, t.TempDir())
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
 
 	var execBuf bytes.Buffer
 	var execMu sync.Mutex
-	DrainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
-	DrainFifo(t, ctx, execStderr)
+	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
 
 	procSpec := &specs.Process{
 		Args: args,
@@ -228,8 +228,8 @@ func shimExec(t *testing.T, ctx context.Context, env *ShimEnv, execID string, ar
 		t.Fatal("failed to marshal exec spec:", err)
 	}
 
-	if _, err := env.TC.Exec(ctx, &taskAPI.ExecProcessRequest{
-		ID:     env.ContainerID,
+	if _, err := env.tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     env.containerID,
 		ExecID: execID,
 		Spec:   execSpec,
 		Stdout: execStdout,
@@ -238,15 +238,15 @@ func shimExec(t *testing.T, ctx context.Context, env *ShimEnv, execID string, ar
 		t.Fatal("exec failed:", err)
 	}
 
-	if _, err := env.TC.Start(ctx, &taskAPI.StartRequest{
-		ID:     env.ContainerID,
+	if _, err := env.tc.Start(ctx, &taskAPI.StartRequest{
+		ID:     env.containerID,
 		ExecID: execID,
 	}); err != nil {
 		t.Fatal("exec start failed:", err)
 	}
 
-	waitResp, err := env.TC.Wait(ctx, &taskAPI.WaitRequest{
-		ID:     env.ContainerID,
+	waitResp, err := env.tc.Wait(ctx, &taskAPI.WaitRequest{
+		ID:     env.containerID,
 		ExecID: execID,
 	})
 	if err != nil {
@@ -258,8 +258,8 @@ func shimExec(t *testing.T, ctx context.Context, env *ShimEnv, execID string, ar
 
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := env.TC.Delete(ctx, &taskAPI.DeleteRequest{
-		ID:     env.ContainerID,
+	if _, err := env.tc.Delete(ctx, &taskAPI.DeleteRequest{
+		ID:     env.containerID,
 		ExecID: execID,
 	}); err != nil {
 		t.Fatal("exec delete failed:", err)
@@ -312,13 +312,13 @@ type stressSubtest struct {
 // are reported via t.Logf.
 //
 // Skipped under -short.
-func (s *TransferSuite) TestStress(t *testing.T) {
+func (s *TransferSuite) testStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	env := s.setup(t, t.Context())
-	ctx, cancel := stressCtx(t, env.Ctx)
+	env := newShimEnv(t, t.Context(), s.cfg)
+	ctx, cancel := stressCtx(t, env.ctx)
 	defer cancel()
 
 	subtests := s.transferStressSubtests(t, env)
@@ -361,20 +361,20 @@ func (s *TransferSuite) TestStress(t *testing.T) {
 		t.Fatalf("%s: %v", firstErrName, firstErr)
 	}
 
-	ShutdownShim(t, env.Ctx, env)
+	shutdownShim(t, env.ctx, env)
 }
 
 // transferStressSubtests returns the stat / write / read stress
 // subtests. The read pool is pre-populated synchronously so by the
 // time the caller spawns goroutines, the read subtest can find its
 // files.
-func (s *TransferSuite) transferStressSubtests(t *testing.T, env *ShimEnv) []stressSubtest {
+func (s *TransferSuite) transferStressSubtests(t *testing.T, env *shimEnv) []stressSubtest {
 	t.Helper()
 
 	for i := 0; i < stressReadPoolSize; i++ {
 		name := fmt.Sprintf("file-%05d.txt", i)
 		content := stressFileContent(i)
-		if err := stressTransferWriteFile(env.Ctx, env, stressReadDir, name, content); err != nil {
+		if err := stressTransferWriteFile(env.ctx, env, stressReadDir, name, content); err != nil {
 			t.Fatalf("read pool setup %d: %v", i, err)
 		}
 	}
@@ -385,7 +385,7 @@ func (s *TransferSuite) transferStressSubtests(t *testing.T, env *ShimEnv) []str
 		{
 			name: "stat",
 			fn: func(ctx context.Context) error {
-				return stressTransferStat(ctx, env, StatDirContainerPath)
+				return stressTransferStat(ctx, env, statDirContainerPath)
 			},
 		},
 		{
@@ -428,7 +428,7 @@ func (s *TransferSuite) transferStressSubtests(t *testing.T, env *ShimEnv) []str
 // directory and asserts the transfer service returns an
 // application-level error (not a timeout).
 func (s *TransferSuite) Fuzz(f *testing.F) {
-	env := s.setup(f, f.Context())
+	env := newShimEnv(f, f.Context(), s.cfg)
 
 	f.Add("missing.txt")
 	f.Add("a/b/c/d.txt")
@@ -442,7 +442,7 @@ func (s *TransferSuite) Fuzz(f *testing.F) {
 		}
 		path := fuzzMissingBase + "/" + suffix
 
-		err := stressTransferStat(env.Ctx, env, path)
+		err := stressTransferStat(env.ctx, env, path)
 		if err == nil {
 			t.Errorf("expected error for missing path %q, got nil", path)
 			return
@@ -519,12 +519,12 @@ func stressCtx(t *testing.T, parent context.Context) (context.Context, context.C
 
 // stressTransferStat performs a single Transfer with NoWalk=true on
 // the given path. The server-side payload is discarded.
-func stressTransferStat(ctx context.Context, env *ShimEnv, path string) error {
+func stressTransferStat(ctx context.Context, env *shimEnv, path string) error {
 	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
 	defer cancel()
 
 	src := &transfer.ContainerPath{
-		ContainerID: env.ContainerID,
+		ContainerID: env.containerID,
 		Path:        path,
 		NoWalk:      true,
 	}
@@ -535,7 +535,7 @@ func stressTransferStat(ctx context.Context, env *ShimEnv, path string) error {
 
 // stressTransferWriteFile writes a single small file as a one-entry
 // tar to the given directory in the container.
-func stressTransferWriteFile(ctx context.Context, env *ShimEnv, dir, name, content string) error {
+func stressTransferWriteFile(ctx context.Context, env *shimEnv, dir, name, content string) error {
 	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
 	defer cancel()
 
@@ -557,7 +557,7 @@ func stressTransferWriteFile(ctx context.Context, env *ShimEnv, dir, name, conte
 
 	src := transfer.NewReadStream(&tarBuf, "application/x-tar")
 	dst := &transfer.ContainerPath{
-		ContainerID: env.ContainerID,
+		ContainerID: env.containerID,
 		Path:        dir,
 	}
 	return stressDoTransfer(subCtx, env, src, dst)
@@ -565,12 +565,12 @@ func stressTransferWriteFile(ctx context.Context, env *ShimEnv, dir, name, conte
 
 // stressTransferReadFile reads a single file back from the container
 // and returns its content.
-func stressTransferReadFile(ctx context.Context, env *ShimEnv, path, name string) (string, error) {
+func stressTransferReadFile(ctx context.Context, env *shimEnv, path, name string) (string, error) {
 	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
 	defer cancel()
 
 	src := &transfer.ContainerPath{
-		ContainerID: env.ContainerID,
+		ContainerID: env.containerID,
 		Path:        path,
 	}
 
@@ -602,17 +602,17 @@ func stressTransferReadFile(ctx context.Context, env *ShimEnv, path, name string
 }
 
 // stressDoTransfer marshals src and dst, then issues the Transfer RPC.
-func stressDoTransfer(ctx context.Context, env *ShimEnv, src, dst any) error {
-	srcAny, err := marshalTransferAny(ctx, src, env.SC)
+func stressDoTransfer(ctx context.Context, env *shimEnv, src, dst any) error {
+	srcAny, err := marshalTransferAny(ctx, src, env.sc)
 	if err != nil {
 		return fmt.Errorf("marshal source: %w", err)
 	}
-	dstAny, err := marshalTransferAny(ctx, dst, env.SC)
+	dstAny, err := marshalTransferAny(ctx, dst, env.sc)
 	if err != nil {
 		return fmt.Errorf("marshal destination: %w", err)
 	}
 
-	tfClient := transferapi.NewTTRPCTransferClient(env.Client)
+	tfClient := transferapi.NewTTRPCTransferClient(env.client)
 	_, err = tfClient.Transfer(ctx, &transferapi.TransferRequest{
 		Source:      srcAny,
 		Destination: dstAny,
