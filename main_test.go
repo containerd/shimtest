@@ -32,52 +32,95 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// Config holds the shimtest configuration.
-type Config struct {
-	// ShimBinary is the shim binary name or path to test.
-	ShimBinary string `json:"shim_binary"`
+// runConfig is the JSON-driven configuration used by this package's
+// own _test.go runner. It embeds the public Config and adds fields
+// only meaningful to the local CLI flow (skip list, uid/gid for
+// re-exec).
+type runConfig struct {
+	Config
 
-	// Env is additional environment variables to set for the test run.
-	Env map[string]string `json:"env,omitempty"`
-
-	// Skip is a list of feature names to skip.
-	// Known features: "transfer", "exec", "uds".
+	// Skip is a list of feature names whose suite the local runner
+	// should not invoke. Recognized values: "exec", "transfer",
+	// "uds", "oom". Library callers achieve the same effect by not
+	// constructing the corresponding XxxSuite.
 	Skip []string `json:"skip,omitempty"`
 
-	// FormatMounts provides the rootfs as formatted images (erofs +
-	// ext4) with a format/mkdir/overlay mount descriptor. The shim
-	// is responsible for mounting them. When false (default), the
-	// rootfs is extracted to a directory and provided as a
-	// pre-mounted overlay.
-	FormatMounts bool `json:"format_mounts,omitempty"`
-
-	// UID is the user ID to run tests as. Defaults to the current
-	// user's UID. When the effective UID is 0 (root) and UID is
-	// set to a non-zero value, the test binary re-executes itself
-	// as that user via sudo.
+	// UID is the user id to run tests as. Defaults to the current
+	// user's uid. When the effective uid is 0 (root) and UID is set
+	// to a non-zero value, the test binary re-executes itself as
+	// that user via sudo.
 	UID *int `json:"uid,omitempty"`
 
-	// GID is the group ID to run tests as. Defaults to the current
-	// user's GID.
+	// GID is the group id to run tests as. Defaults to the current
+	// user's gid.
 	GID *int `json:"gid,omitempty"`
-
-	// Debug enables debug logging on the shim.
-	Debug bool `json:"debug,omitempty"`
 }
 
-const shimtestNamespace = "shimtest"
+// JSON aliases for the embedded Config fields. These match the
+// historical JSON profile schema (snake_case keys).
+type runConfigJSON struct {
+	ShimBinary   string            `json:"shim_binary"`
+	Env          map[string]string `json:"env,omitempty"`
+	FormatMounts bool              `json:"format_mounts,omitempty"`
+	Debug        bool              `json:"debug,omitempty"`
+
+	Skip []string `json:"skip,omitempty"`
+	UID  *int     `json:"uid,omitempty"`
+	GID  *int     `json:"gid,omitempty"`
+}
+
+// UnmarshalJSON populates a runConfig from the historical JSON
+// schema. Goes via runConfigJSON so the embedded Config doesn't
+// require json:"...,inline" — Go's encoding/json doesn't support
+// inline naturally.
+func (c *runConfig) UnmarshalJSON(data []byte) error {
+	var j runConfigJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	c.Config = Config{
+		ShimBinary:   j.ShimBinary,
+		FormatMounts: j.FormatMounts,
+		Env:          j.Env,
+		Debug:        j.Debug,
+	}
+	c.Skip = j.Skip
+	c.UID = j.UID
+	c.GID = j.GID
+	return nil
+}
+
+// MarshalJSON re-serializes a runConfig in the historical schema —
+// used when re-execing as a different user (the parent serializes
+// the resolved config to a temp file the child reads).
+func (c runConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(runConfigJSON{
+		ShimBinary:   c.ShimBinary,
+		FormatMounts: c.FormatMounts,
+		Env:          c.Env,
+		Debug:        c.Debug,
+		Skip:         c.Skip,
+		UID:          c.UID,
+		GID:          c.GID,
+	})
+}
 
 var (
-	testCfg     Config
+	testCfg     runConfig
 	configFlag  = flag.String("shimtest.config", "", "path to shimtest JSON configuration file")
 	configDir   = flag.String("shimtest.configdir", "", "directory of JSON configuration files (one subtest per file)")
-	testConfigs map[string]Config
+	testConfigs map[string]runConfig
 )
 
+// TestMain is the package's entry point. It parses CLI flags, loads
+// JSON configurations, and either runs the test suite directly or
+// re-executes the binary under sudo when a config requires a
+// different uid.
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	// Register OCI spec types with typeurl (normally done by containerd client init).
+	// Register OCI spec types with typeurl (normally done by
+	// containerd client init).
 	const prefix = "types.containerd.io"
 	major := strconv.Itoa(specs.VersionMajor)
 	typeurl.Register(&specs.Process{}, prefix, "opencontainers/runtime-spec", major, "Process")
@@ -88,14 +131,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Check if re-exec is needed for any config.
 	euid := os.Geteuid()
 	uid := os.Getuid()
 	isReexec := os.Getenv("SHIMTEST_REEXEC") != ""
 
 	var exitCode int
 
-	// Find configs that need re-exec (target UID differs from current).
 	var reexecConfigs []string
 	runnable := false
 	for name, cfg := range testConfigs {
@@ -114,7 +155,6 @@ func TestMain(m *testing.M) {
 		exitCode = m.Run()
 	}
 
-	// Re-exec for configs that need a different UID.
 	for _, name := range reexecConfigs {
 		cfg := testConfigs[name]
 		targetUID := *cfg.UID
@@ -135,8 +175,8 @@ func TestMain(m *testing.M) {
 }
 
 // discoverConfigs returns the set of named configs to run.
-func discoverConfigs() map[string]Config {
-	configs := make(map[string]Config)
+func discoverConfigs() map[string]runConfig {
+	configs := make(map[string]runConfig)
 
 	if *configDir != "" {
 		entries, err := os.ReadDir(*configDir)
@@ -168,10 +208,9 @@ func discoverConfigs() map[string]Config {
 		configs[name] = cfg
 	}
 
-	// Fall back to SHIM_BINARY env var for single inline config.
 	if len(configs) == 0 {
 		if v := os.Getenv("SHIM_BINARY"); v != "" {
-			configs["default"] = Config{ShimBinary: v}
+			configs["default"] = runConfig{Config: Config{ShimBinary: v}}
 		}
 	}
 
@@ -179,70 +218,38 @@ func discoverConfigs() map[string]Config {
 }
 
 // loadConfigFile reads and validates a single config file.
-func loadConfigFile(path string) (Config, error) {
+func loadConfigFile(path string) (runConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("failed to read config %s: %w", path, err)
+		return runConfig{}, fmt.Errorf("failed to read config %s: %w", path, err)
 	}
-	var cfg Config
+	var cfg runConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("failed to parse config %s: %w", path, err)
+		return runConfig{}, fmt.Errorf("failed to parse config %s: %w", path, err)
 	}
 
-	// Environment variable overrides config file value.
 	if v := os.Getenv("SHIM_BINARY"); v != "" {
 		cfg.ShimBinary = v
 	}
-
 	if cfg.ShimBinary == "" {
-		return Config{}, fmt.Errorf("shim_binary is required in %s", path)
+		return runConfig{}, fmt.Errorf("shim_binary is required in %s", path)
 	}
-
 	return cfg, nil
 }
 
-// activateConfig sets the global testCfg and applies env vars for
-// the given configuration.
-func activateConfig(cfg Config) {
+// activateConfig sets the package-global testCfg and applies env
+// vars for the given configuration. Called by the runner before
+// dispatching to suites.
+func activateConfig(cfg runConfig) {
 	testCfg = cfg
 	for k, v := range cfg.Env {
 		os.Setenv(k, v)
 	}
 }
 
-// skipFeature skips the current test if the given feature is listed in
-// the config's Skip list. Accepts any testing.TB, so it works for
-// regular tests, benchmarks, and fuzz tests.
-func skipFeature(tb testing.TB, feature string) {
-	tb.Helper()
-	if featureSkipped(feature) {
-		tb.Skipf("feature %q disabled in config", feature)
-	}
-}
-
-// featureSkipped reports whether the given feature is listed in the
-// config's Skip list. Useful for tests that conditionally compose
-// subtests (only adding ones whose feature is enabled) rather than
-// skipping outright via skipFeature.
-func featureSkipped(feature string) bool {
-	for _, s := range testCfg.Skip {
-		if s == feature {
-			return true
-		}
-	}
-	return false
-}
-
-// skipFeatureBench is kept as a thin alias for backward compatibility
-// with existing benchmark callers.
-func skipFeatureBench(b *testing.B, feature string) {
-	b.Helper()
-	skipFeature(b, feature)
-}
-
 // checkRunnable returns an empty string if the config can run in the
 // current process, or a reason string if it cannot.
-func checkRunnable(cfg Config) string {
+func checkRunnable(cfg runConfig) string {
 	uid := os.Getuid()
 	targetUID := uid
 	if cfg.UID != nil {
@@ -254,17 +261,42 @@ func checkRunnable(cfg Config) string {
 	return ""
 }
 
-// reexecAsUser re-executes the test binary as the given user via sudo,
-// passing the full config as a temp file.
-func reexecAsUser(username string, cfg Config) int {
+// featureSkipped reports whether the given feature is in the active
+// config's Skip list.
+func featureSkipped(feature string) bool {
+	for _, s := range testCfg.Skip {
+		if s == feature {
+			return true
+		}
+	}
+	return false
+}
+
+// skipFeature skips the test if the given feature is in the active
+// config's Skip list. Used by benchmarks (and the bench-only
+// skipFeatureBench alias).
+func skipFeature(tb testing.TB, feature string) {
+	tb.Helper()
+	if featureSkipped(feature) {
+		tb.Skipf("feature %q disabled in config", feature)
+	}
+}
+
+// skipFeatureBench is kept for bench backward-compat.
+func skipFeatureBench(b *testing.B, feature string) {
+	b.Helper()
+	skipFeature(b, feature)
+}
+
+// reexecAsUser re-executes the test binary as the given user via
+// sudo, passing the full config as a temp file.
+func reexecAsUser(username string, cfg runConfig) int {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "shimtest: cannot determine executable path: %v\n", err)
 		return 1
 	}
 
-	// Resolve the shim binary to an absolute path so the child
-	// can find it regardless of PATH.
 	shimAbs, err := exec.LookPath(cfg.ShimBinary)
 	if err != nil {
 		shimAbs = cfg.ShimBinary
@@ -272,7 +304,6 @@ func reexecAsUser(username string, cfg Config) int {
 	shimAbs, _ = filepath.Abs(shimAbs)
 	cfg.ShimBinary = shimAbs
 
-	// Write the full config to a temp file the child can read.
 	cfgData, err := json.Marshal(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "shimtest: marshal config for reexec: %v\n", err)
@@ -285,7 +316,6 @@ func reexecAsUser(username string, cfg Config) int {
 	}
 	cfgFile.Write(cfgData)
 	cfgFile.Close()
-	// Make readable by the target user.
 	os.Chmod(cfgFile.Name(), 0644)
 	defer os.Remove(cfgFile.Name())
 
@@ -302,7 +332,6 @@ func reexecAsUser(username string, cfg Config) int {
 	sudoArgs = append(sudoArgs, exe)
 	sudoArgs = append(sudoArgs, "-shimtest.config="+cfgFile.Name())
 
-	// Forward test flags, skipping config flags from the parent.
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

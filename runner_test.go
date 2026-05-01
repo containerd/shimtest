@@ -16,48 +16,54 @@
 
 package shimtest
 
-import "testing"
+import (
+	"sort"
+	"testing"
+)
 
-// TestShim is the top-level test runner. It iterates over all discovered
-// configurations and runs the full test suite for each as a subtest
-// named after the config file.
+// TestShim is the local JSON-driven runner. For each configured
+// profile it activates the config, then dispatches to each suite
+// whose feature isn't in the profile's Skip list.
+//
+// Library callers don't go through TestShim — they import this
+// package and call NewXxxSuite(opts).Run(t) directly from their own
+// test functions.
 func TestShim(t *testing.T) {
-	for name, cfg := range testConfigs {
+	for _, name := range sortedConfigNames() {
+		cfg := testConfigs[name]
 		if reason := checkRunnable(cfg); reason != "" {
-			t.Run(name, func(t *testing.T) {
-				t.Skipf("skipping: %s", reason)
-			})
+			t.Run(name, func(t *testing.T) { t.Skipf("skipping: %s", reason) })
 			continue
 		}
 		t.Run(name, func(t *testing.T) {
 			activateConfig(cfg)
-			t.Run("Lifecycle", testShimLifecycle)
-			t.Run("Exec", testShimExec)
-			t.Run("StdioRoundTrip", testShimStdioRoundTrip)
-			t.Run("Clock", testShimClock)
-			t.Run("ExitCodes", testShimExitCodes)
-			t.Run("InitExitCodes", testShimInitExitCodes)
-			t.Run("OutputThenExit", testShimOutputThenExit)
-			t.Run("Events", testShimEvents)
-			t.Run("LargeFileRead", testShimLargeFileRead)
-			t.Run("BindMountRead", testShimBindMountRead)
-			t.Run("OOM", testShimOOM)
-			t.Run("TransferCopyTo", testTransferCopyTo)
-			t.Run("TransferCopyToAndFrom", testTransferCopyToAndFrom)
-			t.Run("TransferExecVerify", testTransferExecVerify)
-			t.Run("UDSRoundTrip", testShimUDSRoundTrip)
-			t.Run("Stress", testStress)
+			opts := SuiteOptions{Config: cfg.Config}
+
+			NewRunSuite(opts).Run(t)
+			if !featureSkipped("exec") {
+				NewExecSuite(opts).Run(t)
+			}
+			if !featureSkipped("transfer") {
+				NewTransferSuite(opts).Run(t)
+			}
+			if !featureSkipped("uds") {
+				NewUDSSuite(opts).Run(t)
+			}
+			if !featureSkipped("oom") {
+				NewOOMSuite(opts).Run(t)
+			}
 		})
 	}
 }
 
-// BenchmarkShim is the top-level benchmark runner.
+// BenchmarkShim is the top-level benchmark runner. Benchmarks are
+// not yet migrated to suites — they continue to use the package-
+// internal helpers and run directly.
 func BenchmarkShim(b *testing.B) {
-	for name, cfg := range testConfigs {
+	for _, name := range sortedConfigNames() {
+		cfg := testConfigs[name]
 		if reason := checkRunnable(cfg); reason != "" {
-			b.Run(name, func(b *testing.B) {
-				b.Skipf("skipping: %s", reason)
-			})
+			b.Run(name, func(b *testing.B) { b.Skipf("skipping: %s", reason) })
 			continue
 		}
 		b.Run(name, func(b *testing.B) {
@@ -73,4 +79,15 @@ func BenchmarkShim(b *testing.B) {
 			b.Run("UDSRoundTrip", benchmarkShimUDSRoundTrip)
 		})
 	}
+}
+
+// sortedConfigNames returns the keys of testConfigs in deterministic
+// order so subtest names are stable across runs.
+func sortedConfigNames() []string {
+	names := make([]string, 0, len(testConfigs))
+	for n := range testConfigs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }

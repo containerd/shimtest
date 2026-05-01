@@ -44,22 +44,22 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// containerID returns a safe container ID derived from the test name,
-// replacing characters that are invalid in paths.
-func containerID(tb testing.TB) string {
+// ContainerID returns a safe container id derived from the test name,
+// suitable for use as a path component. Both regular tests and
+// benchmarks supply a name via tb.Name().
+func ContainerID(tb testing.TB) string {
 	tb.Helper()
 	name := tb.Name()
-	// Replace slashes and spaces with hyphens for path safety.
 	name = strings.NewReplacer("/", "-", " ", "-").Replace(name)
-	// Truncate and add a random suffix for uniqueness.
 	if len(name) > 60 {
 		name = name[:60]
 	}
-	return strings.ToLower(name) + "-" + randomSuffix()
+	return strings.ToLower(name) + "-" + RandomSuffix()
 }
 
-// randomSuffix generates a short random hex string for uniqueness.
-func randomSuffix() string {
+// RandomSuffix returns a short random hex string. Used to give test
+// runs unique identifiers (container ids, tmp dirs).
+func RandomSuffix() string {
 	b := make([]byte, 4)
 	f, err := os.Open("/dev/urandom")
 	if err != nil {
@@ -70,9 +70,18 @@ func randomSuffix() string {
 	return fmt.Sprintf("%x", b)
 }
 
-// createOCISpec writes a minimal OCI spec config.json at the given path.
-// Each opt is applied to the spec in order before it is written.
-func createOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(*specs.Spec)) {
+// CreateOCISpec writes a minimal OCI spec config.json under bundleDir.
+// Each opt is applied in order before the spec is written. When the
+// process is rootless and the rootfs isn't being mounted by the shim,
+// a user namespace + uid/gid mappings are added automatically.
+func CreateOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(*specs.Spec)) {
+	CreateOCISpecCfg(tb, bundleDir, args, Config{}, opts...)
+}
+
+// CreateOCISpecCfg is CreateOCISpec with an explicit Config — needed
+// when FormatMounts changes rootless namespace handling. Most callers
+// prefer CreateOCISpec via the suite's stored Config.
+func CreateOCISpecCfg(tb testing.TB, bundleDir string, args []string, cfg Config, opts ...func(*specs.Spec)) {
 	tb.Helper()
 
 	spec := specs.Spec{
@@ -87,16 +96,8 @@ func createOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(
 			Env:  []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		},
 		Mounts: []specs.Mount{
-			{
-				Destination: "/proc",
-				Type:        "proc",
-				Source:      "proc",
-			},
-			{
-				Destination: "/dev",
-				Type:        "tmpfs",
-				Source:      "tmpfs",
-			},
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs"},
 		},
 		Linux: &specs.Linux{
 			Namespaces: []specs.LinuxNamespace{
@@ -105,12 +106,7 @@ func createOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(
 		},
 	}
 
-	// When running rootless, runc requires a user namespace and UID/GID
-	// mappings. A PID namespace is also needed so proc can be mounted.
-	// When using format mounts the shim runs the container inside a
-	// VM where the runtime is always root. User namespace mappings
-	// based on the host UID are not applicable.
-	if os.Getuid() != 0 && !testCfg.FormatMounts {
+	if os.Getuid() != 0 && !cfg.FormatMounts {
 		spec.Linux.Namespaces = append(spec.Linux.Namespaces,
 			specs.LinuxNamespace{Type: specs.UserNamespace},
 			specs.LinuxNamespace{Type: specs.PIDNamespace},
@@ -132,23 +128,23 @@ func createOCISpec(tb testing.TB, bundleDir string, args []string, opts ...func(
 	if err != nil {
 		tb.Fatal("failed to marshal OCI spec:", err)
 	}
-
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), data, 0644); err != nil {
 		tb.Fatal("failed to write config.json:", err)
 	}
 }
 
-// withExtraMounts appends the given mounts to the OCI spec.
-func withExtraMounts(mounts ...specs.Mount) func(*specs.Spec) {
+// WithExtraMounts returns a CreateOCISpec opt that appends mounts to
+// the spec.
+func WithExtraMounts(mounts ...specs.Mount) func(*specs.Spec) {
 	return func(s *specs.Spec) {
 		s.Mounts = append(s.Mounts, mounts...)
 	}
 }
 
-// withMemoryLimit sets the memory limit (in bytes) on the OCI spec,
-// with swap set equal to the limit so the container cannot grow via
-// swap before the OOM killer fires.
-func withMemoryLimit(bytes int64) func(*specs.Spec) {
+// WithMemoryLimit returns a CreateOCISpec opt that sets the memory
+// limit (in bytes) on the spec, with swap clamped equal to the limit
+// so the container cannot grow via swap before the OOM killer fires.
+func WithMemoryLimit(bytes int64) func(*specs.Spec) {
 	return func(s *specs.Spec) {
 		if s.Linux.Resources == nil {
 			s.Linux.Resources = &specs.LinuxResources{}
@@ -160,19 +156,20 @@ func withMemoryLimit(bytes int64) func(*specs.Spec) {
 	}
 }
 
-// shimSetup finds the shim binary and creates a bundle directory.
-// Returns the shim binary path, bundle directory, and rootfs mounts
-// built from the embedded testbin rootfs.
-func shimSetup(tb testing.TB) (shimBin, bundleDir string, rootfsMounts []*types.Mount) {
+// ShimSetup resolves the shim binary, creates a bundle directory, and
+// builds rootfs mounts from the embedded testbin. Returns the shim
+// binary's absolute path, the bundle directory, and the rootfs
+// mounts to pass to CreateTaskRequest.
+func ShimSetup(tb testing.TB, cfg Config) (shimBin, bundleDir string, rootfsMounts []*types.Mount) {
 	tb.Helper()
 
-	shimBin, err := exec.LookPath(testCfg.ShimBinary)
+	shimBin, err := exec.LookPath(cfg.ShimBinary)
 	if err != nil {
-		tb.Fatalf("shim binary %q not found in PATH: %v", testCfg.ShimBinary, err)
+		tb.Fatalf("shim binary %q not found in PATH: %v", cfg.ShimBinary, err)
 	}
 
-	// Ensure the shim binary's directory is in PATH so that sibling
-	// binaries (e.g. nerdbox-kernel, libkrun.so) are discoverable.
+	// Ensure the shim binary's directory is in PATH so sibling
+	// helpers (kernels, libraries) co-located with the shim resolve.
 	shimDir := filepath.Dir(shimBin)
 	if !strings.Contains(os.Getenv("PATH"), shimDir) {
 		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
@@ -184,33 +181,27 @@ func shimSetup(tb testing.TB) (shimBin, bundleDir string, rootfsMounts []*types.
 		tb.Fatal("failed to resolve bundle dir:", err)
 	}
 
-	// Create the rootfs directory (needed for the bundle even if using mounts)
 	rootfsDir := filepath.Join(bundleDir, "rootfs")
 	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
 		tb.Fatal("failed to create rootfs dir:", err)
 	}
-	// Unmount rootfs on cleanup — the shim may have mounted an overlay
-	// here, and without a mount namespace it persists in the host.
-	tb.Cleanup(func() {
-		mount.Unmount(rootfsDir, 0)
-	})
+	tb.Cleanup(func() { mount.Unmount(rootfsDir, 0) })
 
-	rootfsMounts = buildEmbeddedRootfs(tb, bundleDir)
+	rootfsMounts = BuildEmbeddedRootfs(tb, bundleDir, cfg)
 
 	return shimBin, bundleDir, rootfsMounts
 }
 
-// shortSocketPaths caches the short-path mapping so that multiple
-// calls to containerdSockPath for the same bundleDir return the same
-// path.
+// shortSocketPaths caches the short-path mapping so multiple calls to
+// ContainerdSockPath for the same bundleDir return the same path.
 var shortSocketPaths sync.Map
 
-// containerdSockPath returns the unix socket path the shim dials as
+// ContainerdSockPath returns the unix socket path the shim dials as
 // its containerd events endpoint. On macOS, AF_UNIX paths are limited
-// to 104 bytes, so we fall back to a short /tmp path when the bundle
-// directory is too deep. Results are cached per bundleDir so all
-// callers within the same test get the same path.
-func containerdSockPath(tb testing.TB, bundleDir string) string {
+// to 104 bytes, so a short /tmp path is used when the bundle is too
+// deep. The result is cached per bundleDir so all callers within a
+// single test get the same path.
+func ContainerdSockPath(tb testing.TB, bundleDir string) string {
 	tb.Helper()
 	candidate := filepath.Join(bundleDir, "c.sock")
 	if len(candidate) <= 104 {
@@ -232,8 +223,8 @@ func containerdSockPath(tb testing.TB, bundleDir string) string {
 	return p
 }
 
-// createIOFifos creates stdout and stderr FIFOs in the given directory.
-func createIOFifos(tb testing.TB, dir string) (stdoutPath, stderrPath string) {
+// CreateIOFifos creates stdout and stderr FIFOs in dir.
+func CreateIOFifos(tb testing.TB, dir string) (stdoutPath, stderrPath string) {
 	tb.Helper()
 	stdoutPath = filepath.Join(dir, "stdout")
 	stderrPath = filepath.Join(dir, "stderr")
@@ -246,8 +237,8 @@ func createIOFifos(tb testing.TB, dir string) (stdoutPath, stderrPath string) {
 	return
 }
 
-// createStdioFifos creates stdin, stdout, and stderr FIFOs in the given directory.
-func createStdioFifos(tb testing.TB, dir string) (stdinPath, stdoutPath, stderrPath string) {
+// CreateStdioFifos creates stdin, stdout, and stderr FIFOs in dir.
+func CreateStdioFifos(tb testing.TB, dir string) (stdinPath, stdoutPath, stderrPath string) {
 	tb.Helper()
 	stdinPath = filepath.Join(dir, "stdin")
 	stdoutPath = filepath.Join(dir, "stdout")
@@ -264,8 +255,9 @@ func createStdioFifos(tb testing.TB, dir string) (stdinPath, stdoutPath, stderrP
 	return
 }
 
-// drainFifo opens a FIFO for reading and discards all data in a goroutine.
-func drainFifo(tb testing.TB, ctx context.Context, path string) {
+// DrainFifo opens a FIFO for reading and discards all data in a
+// background goroutine. Closes on tb cleanup.
+func DrainFifo(tb testing.TB, ctx context.Context, path string) {
 	tb.Helper()
 	f, err := fifo.OpenFifo(ctx, path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -282,8 +274,9 @@ func drainFifo(tb testing.TB, ctx context.Context, path string) {
 	tb.Cleanup(func() { f.Close() })
 }
 
-// drainFifoInto opens a FIFO for reading and copies data into buf (protected by mu).
-func drainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.Buffer, mu *sync.Mutex) {
+// DrainFifoInto opens a FIFO for reading and copies data into buf
+// (protected by mu).
+func DrainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.Buffer, mu *sync.Mutex) {
 	tb.Helper()
 	f, err := fifo.OpenFifo(ctx, path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -306,16 +299,12 @@ func drainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.B
 	tb.Cleanup(func() { f.Close() })
 }
 
-// newCreateTaskRequest builds a CreateTaskRequest with runc Options.
-// SystemdCgroup is explicitly set to false on every request so both
-// root and rootless runs use the cgroupfs manager — otherwise root
-// on systemd hosts (notably GHA) pays tens of ms of DBus round-trips
-// per container lifecycle, skewing benchmark comparisons.
-//
-// Rootless paths additionally need:
-//   - IoUid/IoGid set to the current user (avoids chown EPERM)
-//   - Root set to a writable temp directory (avoids /run/containerd/runc EPERM)
-func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, rootfs []*types.Mount) *taskAPI.CreateTaskRequest {
+// NewCreateTaskRequest builds a CreateTaskRequest with runc Options.
+// SystemdCgroup is forced off so root and rootless runs both use the
+// cgroupfs manager — otherwise root on systemd hosts pays tens of ms
+// of DBus round-trips per container, skewing benchmarks. Rootless
+// paths additionally get IoUid/IoGid set and a writable Root.
+func NewCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, rootfs []*types.Mount) *taskAPI.CreateTaskRequest {
 	tb.Helper()
 	req := &taskAPI.CreateTaskRequest{
 		ID:     id,
@@ -324,9 +313,7 @@ func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, root
 		Stderr: stderr,
 		Rootfs: rootfs,
 	}
-	opts := &runcopt.Options{
-		SystemdCgroup: false,
-	}
+	opts := &runcopt.Options{SystemdCgroup: false}
 	uid := os.Getuid()
 	gid := os.Getgid()
 	if uid != 0 {
@@ -340,30 +327,25 @@ func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, root
 	if err != nil {
 		tb.Fatal("failed to marshal runc options:", err)
 	}
-	req.Options = &anypb.Any{
-		TypeUrl: any.TypeUrl,
-		Value:   any.Value,
-	}
+	req.Options = &anypb.Any{TypeUrl: any.TypeUrl, Value: any.Value}
 	return req
 }
 
-// bootstrapParams is the JSON payload returned on stdout from `shim start`.
-type bootstrapParams struct {
+// BootstrapParams is the JSON / protobuf payload returned on stdout
+// from `shim start`.
+type BootstrapParams struct {
 	Version  int    `json:"version"`
 	Address  string `json:"address"`
 	Protocol string `json:"protocol"`
 }
 
-// parseBootstrapResult tries to decode the shim's start response.
-// Newer shims (containerd v2.3+) return protobuf; older ones return JSON.
-func parseBootstrapResult(data []byte, params *bootstrapParams) error {
-	// Try JSON first (older shims).
+// ParseBootstrapResult tries to decode the shim's start response.
+// Newer shims (containerd v2.3+) return protobuf; older ones return
+// JSON.
+func ParseBootstrapResult(data []byte, params *BootstrapParams) error {
 	if len(data) > 0 && data[0] == '{' {
 		return json.Unmarshal(data, params)
 	}
-
-	// Try protobuf: BootstrapResult has version (field 1, varint),
-	// address (field 2, string), protocol (field 3, string).
 	b := data
 	for len(b) > 0 {
 		num, wtype, n := protowire.ConsumeTag(b)
@@ -403,9 +385,10 @@ func parseBootstrapResult(data []byte, params *bootstrapParams) error {
 	return nil
 }
 
-// startShim runs the shim binary's "start" subcommand and returns the
-// bootstrap params.
-func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams {
+// StartShim runs the shim binary's "start" subcommand and returns
+// the bootstrap params. Registers cleanup that ensures the shim
+// process exits before the test ends.
+func StartShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) BootstrapParams {
 	tb.Helper()
 
 	socketDir, err := os.MkdirTemp("/tmp", "nb-")
@@ -422,9 +405,8 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	if err != nil {
 		tb.Fatal("failed to open log fifo:", err)
 	}
-	// Buffer shim logs and only dump them on test failure. Benchmarks
-	// always discard — shim log lines would otherwise truncate the
-	// benchmark result output.
+	// Buffer shim logs and only dump them on test failure.
+	// Benchmarks always discard.
 	_, isBench := tb.(*testing.B)
 	var logBuf bytes.Buffer
 	done := make(chan struct{})
@@ -441,10 +423,6 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 			}
 		}
 	}()
-	// Cleanup order (LIFO): dump runs first (below). It falls through
-	// to the Close/wait cleanup, which shuts the FIFO and blocks until
-	// the reader has finished appending — so the buffer is complete
-	// by the time we read it in the dump.
 	if !isBench {
 		tb.Cleanup(func() {
 			if !tb.Failed() {
@@ -461,16 +439,15 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 		<-done
 	})
 
-	containerdAddr := containerdSockPath(tb, bundleDir)
+	containerdAddr := ContainerdSockPath(tb, bundleDir)
 
-	// Build bootstrap params to send on stdin (new protocol).
 	bootParams := &bootapi.BootstrapParams{
 		InstanceID:            id,
 		Namespace:             ns,
 		ContainerdGrpcAddress: containerdAddr,
 		SocketDir:             &socketDir,
 	}
-	if testCfg.Debug {
+	if cfg.Debug {
 		bootParams.LogLevel = bootapi.LogLevel_LOG_LEVEL_DEBUG
 	}
 	bootData, err := proto.Marshal(bootParams)
@@ -478,13 +455,12 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 		tb.Fatal("marshal bootstrap params:", err)
 	}
 
-	// Legacy flags are still passed for older shims.
 	shimArgs := []string{
 		"-namespace", ns,
 		"-id", id,
 		"-address", containerdAddr,
 	}
-	if testCfg.Debug {
+	if cfg.Debug {
 		shimArgs = append(shimArgs, "-debug")
 	}
 	shimArgs = append(shimArgs, "start")
@@ -494,10 +470,6 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 	cmd.Env = append(os.Environ(),
 		"GOMAXPROCS=2",
 		"SHIM_SOCKET_DIR="+socketDir,
-		// TTRPC_ADDRESS is where the shim forwards events. When a test
-		// has bound an eventRecorder to this path it will receive them;
-		// otherwise the publish calls fail with ENOENT and are logged
-		// but not fatal.
 		"TTRPC_ADDRESS="+containerdAddr,
 	)
 
@@ -509,16 +481,14 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 		tb.Fatalf("shim start failed: %v\nstderr: %s", err, stderr.String())
 	}
 
-	var params bootstrapParams
-	if err := parseBootstrapResult(stdout.Bytes(), &params); err != nil {
+	var params BootstrapParams
+	if err := ParseBootstrapResult(stdout.Bytes(), &params); err != nil {
 		tb.Fatalf("failed to parse bootstrap params: %v\nraw stdout: %s", err, stdout.String())
 	}
-
 	if params.Address == "" {
 		tb.Fatal("shim returned empty address")
 	}
 
-	// Read the shim PID now so we can verify cleanup later.
 	var shimPid int
 	if data, err := os.ReadFile(filepath.Join(bundleDir, "shim.pid")); err == nil {
 		shimPid, _ = parseIntBytes(data)
@@ -531,13 +501,9 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 		if shimPid <= 0 {
 			return
 		}
-
-		// Check if already gone.
 		if syscall.Kill(shimPid, 0) != nil {
 			return
 		}
-
-		// Send SIGTERM and wait up to 3s for graceful exit.
 		syscall.Kill(shimPid, syscall.SIGTERM)
 		for i := 0; i < 30; i++ {
 			time.Sleep(100 * time.Millisecond)
@@ -545,11 +511,8 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string) bootstrapParams
 				return
 			}
 		}
-
-		// Still alive — force kill.
 		tb.Errorf("shim process %d did not exit after SIGTERM, sending SIGKILL", shimPid)
 		syscall.Kill(shimPid, syscall.SIGKILL)
-		// Wait for the zombie to be reaped.
 		if p, err := os.FindProcess(shimPid); err == nil {
 			p.Wait()
 		}
@@ -571,8 +534,8 @@ func parseIntBytes(b []byte) (int, error) {
 	return n, nil
 }
 
-// connectShim dials the shim's TTRPC unix socket.
-func connectShim(tb testing.TB, address string) net.Conn {
+// ConnectShim dials the shim's TTRPC unix socket.
+func ConnectShim(tb testing.TB, address string) net.Conn {
 	tb.Helper()
 	addr := strings.TrimPrefix(address, "unix://")
 	conn, err := net.Dial("unix", addr)
