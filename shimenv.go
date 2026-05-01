@@ -18,9 +18,12 @@ package shimtest
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	streamingapi "github.com/containerd/containerd/api/services/streaming/v1"
@@ -40,6 +43,10 @@ type shimEnv struct {
 	tc          taskAPI.TTRPCTaskService
 	sc          streaming.StreamCreator
 	containerID string
+	// shimPID is the OS pid of the shim process, read from
+	// bundleDir/shim.pid after startShim. Zero if the file was
+	// missing or unparseable.
+	shimPID int
 }
 
 // newShimEnv starts a shim, creates and starts a container, and
@@ -61,24 +68,22 @@ func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
 
 	ctx := namespaces.WithNamespace(baseCtx, shimtestNamespace)
 
+	// Bind a no-op events listener so the shim's outgoing event
+	// publishes succeed instead of timing out for 5s each.
+	startEventsRecorder(tb, bundleDir)
+
 	params := startShim(tb, shimBin, bundleDir, cid, shimtestNamespace, cfg)
+
+	var shimPID int
+	if data, err := os.ReadFile(filepath.Join(bundleDir, "shim.pid")); err == nil {
+		shimPID, _ = parseIntBytes(data)
+	}
 
 	conn := connectShim(tb, params.Address)
 	client := ttrpc.NewClient(conn)
 	tb.Cleanup(func() { client.Close() })
 
 	tc := taskAPI.NewTTRPCTaskClient(client)
-
-	// Probe the transfer service — skip transfer-using callers when
-	// the shim doesn't implement it.
-	tfProbe := transferapi.NewTTRPCTransferClient(client)
-	_, probeErr := tfProbe.Transfer(ctx, &transferapi.TransferRequest{})
-	if probeErr != nil {
-		msg := probeErr.Error()
-		if strings.Contains(msg, "Unimplemented") || strings.Contains(msg, "unknown service") {
-			tb.Skip("skipping: shim does not support transfer service:", probeErr)
-		}
-	}
 
 	sc := &ttrpcStreamCreator{client: streamingapi.NewTTRPCStreamingClient(client)}
 
@@ -97,14 +102,37 @@ func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
 		tc:          tc,
 		sc:          sc,
 		containerID: cid,
+		shimPID:     shimPID,
+	}
+}
+
+// skipIfNoTransfer probes the transfer service with an empty request
+// and skips the test if the shim doesn't implement it. Tests that
+// require the transfer service should call this immediately after
+// newShimEnv.
+func skipIfNoTransfer(tb testing.TB, env *shimEnv) {
+	tb.Helper()
+	tfClient := transferapi.NewTTRPCTransferClient(env.client)
+	_, err := tfClient.Transfer(env.ctx, &transferapi.TransferRequest{})
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "Unimplemented") || strings.Contains(msg, "unknown service") {
+		tb.Skip("skipping: shim does not support transfer service:", err)
 	}
 }
 
 // shutdownShim kills, waits, deletes, and shuts down the shim's task.
 // Best-effort: errors are logged on tb but not fatal, since it's
 // commonly called as cleanup after a test that's already failed.
+// The whole sequence is bounded by shutdownTimeout so a wedged shim
+// can't hijack the test deadline.
 func shutdownShim(tb testing.TB, ctx context.Context, env *shimEnv) {
 	tb.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+	defer cancel()
 
 	tb.Log("killing task")
 	env.tc.Kill(ctx, &taskAPI.KillRequest{
@@ -122,3 +150,8 @@ func shutdownShim(tb testing.TB, ctx context.Context, env *shimEnv) {
 	tb.Log("shutting down shim")
 	env.tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: env.containerID})
 }
+
+// shutdownTimeout caps the cumulative time shutdownShim spends across
+// its Kill/Wait/Delete/Shutdown RPCs. Keeps a wedged shim from
+// blocking test cleanup for the rest of the test deadline.
+const shutdownTimeout = 10 * time.Second

@@ -54,6 +54,9 @@ func TestShim(t *testing.T) {
 			if !featureSkipped("oom") {
 				shimtest.NewOOMSuite(c).Run(t)
 			}
+			t.Run("Stress", shimtest.NewStressSuite(c, shimtest.StressOptions{
+				Transfer: !featureSkipped("transfer"),
+			}).Run)
 		})
 	}
 }

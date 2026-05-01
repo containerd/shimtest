@@ -21,11 +21,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,7 +41,6 @@ import (
 // top-level FuzzXxx in their own _test.go.
 type TransferSuite struct {
 	cfg Config
-	
 }
 
 // NewTransferSuite constructs a TransferSuite from the given options.
@@ -53,20 +50,22 @@ func NewTransferSuite(cfg Config) *TransferSuite {
 
 // Run runs every test in the suite as a subtest of t. Subtest names
 // are kept stable (TransferCopyTo, TransferCopyToAndFrom,
-// TransferExecVerify, Stress) so existing -test.run filters and CI
-// workflow patterns keep matching.
+// TransferExecVerify) so existing -test.run filters and CI workflow
+// patterns keep matching. The transfer stress test moved to
+// StressSuite; construct one of those with StressOptions{Transfer:
+// true} to run it.
 func (s *TransferSuite) Run(t *testing.T) {
 	t.Helper()
 	t.Run("TransferCopyTo", s.testCopyTo)
 	t.Run("TransferCopyToAndFrom", s.testCopyToAndFrom)
 	t.Run("TransferExecVerify", s.testExecVerify)
-	t.Run("Stress", s.testStress)
 }
 
 // TestCopyTo copies a small file into a running container via the
 // transfer service.
 func (s *TransferSuite) testCopyTo(t *testing.T) {
 	env := newShimEnv(t, t.Context(), s.cfg)
+	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
 	copyToContainer(t, env.ctx, env, testContent, "/tmp")
@@ -79,6 +78,7 @@ func (s *TransferSuite) testCopyTo(t *testing.T) {
 // content matches.
 func (s *TransferSuite) testCopyToAndFrom(t *testing.T) {
 	env := newShimEnv(t, t.Context(), s.cfg)
+	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
 	copyToContainer(t, env.ctx, env, testContent, "/tmp")
@@ -96,6 +96,7 @@ func (s *TransferSuite) testCopyToAndFrom(t *testing.T) {
 // TestExecVerify copies a file in and verifies it via /bin/cat exec.
 func (s *TransferSuite) testExecVerify(t *testing.T) {
 	env := newShimEnv(t, t.Context(), s.cfg)
+	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
 	copyToContainer(t, env.ctx, env, testContent, "/tmp")
@@ -270,152 +271,6 @@ func shimExec(t *testing.T, ctx context.Context, env *shimEnv, execID string, ar
 	return execBuf.String()
 }
 
-//
-// ----- Stress test ---------------------------------------------------
-//
-
-// stressIterationTimeout caps how long any single Transfer is allowed
-// to take. A healthy iteration finishes in single-digit milliseconds;
-// anything more than this is a hang.
-const stressIterationTimeout = 5 * time.Second
-
-// stressSoakBuffer is how much headroom the stress test leaves before
-// the test framework's deadline. Set generously so a normal stress
-// run with the default 10-minute test timeout never bumps into it.
-const stressSoakBuffer = 1 * time.Minute
-
-// stressReadPoolSize is the number of files the read subtest
-// pre-populates as a setup phase.
-const stressReadPoolSize = 1000
-
-// stressReadDir / stressWriteDir are the in-container directories
-// used by the read and write stress subtests.
-const (
-	stressReadDir  = "/tmp/stress-read"
-	stressWriteDir = "/tmp/stress-write"
-)
-
-// fuzzMissingBase is the in-container directory that the missing-file
-// fuzz tests synthesize paths under. The test never creates it, so
-// any path under it (with a sanitized suffix) is guaranteed to not
-// exist.
-const fuzzMissingBase = "/.fuzz-missing"
-
-// stressSubtest is one concurrent workload run inside TestStress.
-type stressSubtest struct {
-	name string
-	fn   func(ctx context.Context) error
-}
-
-// TestStress launches stat/write/read goroutines against a shared
-// shim env and stops at the first failure. Subtest iteration counts
-// are reported via t.Logf.
-//
-// Skipped under -short.
-func (s *TransferSuite) testStress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping stress test in short mode")
-	}
-
-	env := newShimEnv(t, t.Context(), s.cfg)
-	ctx, cancel := stressCtx(t, env.ctx)
-	defer cancel()
-
-	subtests := s.transferStressSubtests(t, env)
-
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	type result struct {
-		name    string
-		iters   int64
-		elapsed time.Duration
-		err     error
-	}
-	results := make(chan result, len(subtests))
-
-	for _, st := range subtests {
-		go func() {
-			iters, elapsed, err := runStress(runCtx, st.fn)
-			if err != nil {
-				runCancel()
-			}
-			results <- result{st.name, iters, elapsed, err}
-		}()
-	}
-
-	var firstErr error
-	var firstErrName string
-	for i := 0; i < len(subtests); i++ {
-		r := <-results
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-			firstErrName = r.name
-		}
-		rate := float64(r.iters) / r.elapsed.Seconds()
-		t.Logf("%s: %d iterations in %s (%.0f iter/s)",
-			r.name, r.iters, r.elapsed.Round(time.Millisecond), rate)
-	}
-
-	if firstErr != nil {
-		t.Fatalf("%s: %v", firstErrName, firstErr)
-	}
-
-	shutdownShim(t, env.ctx, env)
-}
-
-// transferStressSubtests returns the stat / write / read stress
-// subtests. The read pool is pre-populated synchronously so by the
-// time the caller spawns goroutines, the read subtest can find its
-// files.
-func (s *TransferSuite) transferStressSubtests(t *testing.T, env *shimEnv) []stressSubtest {
-	t.Helper()
-
-	for i := 0; i < stressReadPoolSize; i++ {
-		name := fmt.Sprintf("file-%05d.txt", i)
-		content := stressFileContent(i)
-		if err := stressTransferWriteFile(env.ctx, env, stressReadDir, name, content); err != nil {
-			t.Fatalf("read pool setup %d: %v", i, err)
-		}
-	}
-
-	var writeIdx, readIdx atomic.Int64
-
-	return []stressSubtest{
-		{
-			name: "stat",
-			fn: func(ctx context.Context) error {
-				return stressTransferStat(ctx, env, statDirContainerPath)
-			},
-		},
-		{
-			name: "write",
-			fn: func(ctx context.Context) error {
-				i := writeIdx.Add(1)
-				name := fmt.Sprintf("file-%08d.txt", i)
-				return stressTransferWriteFile(ctx, env, stressWriteDir, name, stressFileContent(int(i)))
-			},
-		},
-		{
-			name: "read",
-			fn: func(ctx context.Context) error {
-				i := int(readIdx.Add(1)-1) % stressReadPoolSize
-				name := fmt.Sprintf("file-%05d.txt", i)
-				want := stressFileContent(i)
-				path := stressReadDir + "/" + name
-				got, err := stressTransferReadFile(ctx, env, path, name)
-				if err != nil {
-					return err
-				}
-				if got != want {
-					return fmt.Errorf("content mismatch for %s: got %q, want %q", name, got, want)
-				}
-				return nil
-			},
-		},
-	}
-}
-
 // Fuzz exposes the missing-file fuzz body for use by a top-level
 // FuzzXxx in any package. The caller's FuzzTransferMissing should
 // look like:
@@ -429,6 +284,7 @@ func (s *TransferSuite) transferStressSubtests(t *testing.T, env *shimEnv) []str
 // application-level error (not a timeout).
 func (s *TransferSuite) Fuzz(f *testing.F) {
 	env := newShimEnv(f, f.Context(), s.cfg)
+	skipIfNoTransfer(f, env)
 
 	f.Add("missing.txt")
 	f.Add("a/b/c/d.txt")
@@ -471,151 +327,4 @@ func validFuzzSuffix(s string) bool {
 		return false
 	}
 	return true
-}
-
-// stressFileContent is the canonical content for the i-th stress file.
-func stressFileContent(i int) string {
-	return fmt.Sprintf("stress-content-%05d\n", i)
-}
-
-// runStress runs fn in a sequential loop until fn returns an error
-// or the parent context is canceled.
-//
-// fn receives a context detached from the parent so cancellation of
-// the parent does not propagate into an in-flight iteration. The
-// iteration runs to completion (success or its own per-iteration
-// timeout); the loop then sees the parent context's Done and exits.
-func runStress(ctx context.Context, fn func(ctx context.Context) error) (int64, time.Duration, error) {
-	start := time.Now()
-
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var iters int64
-	for ctx.Err() == nil {
-		if err := fn(runCtx); err != nil {
-			return iters, time.Since(start), err
-		}
-		iters++
-	}
-	return iters, time.Since(start), nil
-}
-
-// stressCtx derives a cancel context from parent, additionally bounded
-// by t.Deadline() if one is set, with stressSoakBuffer of headroom.
-// Skips when there isn't enough room for a meaningful run.
-func stressCtx(t *testing.T, parent context.Context) (context.Context, context.CancelFunc) {
-	t.Helper()
-	d, ok := t.Deadline()
-	if !ok {
-		return context.WithCancel(parent)
-	}
-	if remaining := time.Until(d); remaining < stressSoakBuffer {
-		t.Skipf("skipping: stress needs at least %s before -test.timeout, only %s left",
-			stressSoakBuffer, remaining.Round(time.Millisecond))
-	}
-	return context.WithDeadline(parent, d.Add(-stressSoakBuffer))
-}
-
-// stressTransferStat performs a single Transfer with NoWalk=true on
-// the given path. The server-side payload is discarded.
-func stressTransferStat(ctx context.Context, env *shimEnv, path string) error {
-	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
-	defer cancel()
-
-	src := &transfer.ContainerPath{
-		ContainerID: env.containerID,
-		Path:        path,
-		NoWalk:      true,
-	}
-	dst := transfer.NewWriteStream(&nopWriteCloser{io.Discard}, "application/x-tar")
-
-	return stressDoTransfer(subCtx, env, src, dst)
-}
-
-// stressTransferWriteFile writes a single small file as a one-entry
-// tar to the given directory in the container.
-func stressTransferWriteFile(ctx context.Context, env *shimEnv, dir, name, content string) error {
-	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
-	defer cancel()
-
-	var tarBuf bytes.Buffer
-	tw := tar.NewWriter(&tarBuf)
-	if err := tw.WriteHeader(&tar.Header{
-		Name: name,
-		Mode: 0644,
-		Size: int64(len(content)),
-	}); err != nil {
-		return fmt.Errorf("write tar header: %w", err)
-	}
-	if _, err := tw.Write([]byte(content)); err != nil {
-		return fmt.Errorf("write tar body: %w", err)
-	}
-	if err := tw.Close(); err != nil {
-		return fmt.Errorf("close tar: %w", err)
-	}
-
-	src := transfer.NewReadStream(&tarBuf, "application/x-tar")
-	dst := &transfer.ContainerPath{
-		ContainerID: env.containerID,
-		Path:        dir,
-	}
-	return stressDoTransfer(subCtx, env, src, dst)
-}
-
-// stressTransferReadFile reads a single file back from the container
-// and returns its content.
-func stressTransferReadFile(ctx context.Context, env *shimEnv, path, name string) (string, error) {
-	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
-	defer cancel()
-
-	src := &transfer.ContainerPath{
-		ContainerID: env.containerID,
-		Path:        path,
-	}
-
-	var received bytes.Buffer
-	dst := transfer.NewWriteStream(&nopWriteCloser{&received}, "application/x-tar")
-
-	if err := stressDoTransfer(subCtx, env, src, dst); err != nil {
-		return "", err
-	}
-
-	tr := tar.NewReader(&received)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("read tar: %w", err)
-		}
-		if strings.HasSuffix(hdr.Name, name) {
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				return "", fmt.Errorf("read tar entry: %w", err)
-			}
-			return string(data), nil
-		}
-	}
-	return "", fmt.Errorf("entry %q not found in tar", name)
-}
-
-// stressDoTransfer marshals src and dst, then issues the Transfer RPC.
-func stressDoTransfer(ctx context.Context, env *shimEnv, src, dst any) error {
-	srcAny, err := marshalTransferAny(ctx, src, env.sc)
-	if err != nil {
-		return fmt.Errorf("marshal source: %w", err)
-	}
-	dstAny, err := marshalTransferAny(ctx, dst, env.sc)
-	if err != nil {
-		return fmt.Errorf("marshal destination: %w", err)
-	}
-
-	tfClient := transferapi.NewTTRPCTransferClient(env.client)
-	_, err = tfClient.Transfer(ctx, &transferapi.TransferRequest{
-		Source:      srcAny,
-		Destination: dstAny,
-	})
-	return err
 }
