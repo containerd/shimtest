@@ -348,6 +348,13 @@ const stressSoakBuffer = 1 * time.Minute
 // the transfer stress pre-populates as a setup phase.
 const stressReadPoolSize = 1000
 
+// stressWritePoolSize bounds the write subtest so its on-disk
+// footprint is fixed: iterations cycle through this many filenames
+// (overwriting each time) instead of growing unboundedly. Without
+// this bound the container's writable layer fills up after ~13k
+// iterations on a default-size scratch device.
+const stressWritePoolSize = 100
+
 // stressReadDir / stressWriteDir are the in-container directories
 // used by the read and write transfer-stress subtests.
 const (
@@ -465,8 +472,13 @@ func (s *StressSuite) transferStressSubtests(t *testing.T, env *shimEnv) []stres
 		{
 			name: "write",
 			fn: func(ctx context.Context) error {
+				// Cycle through stressWritePoolSize filenames so each
+				// iteration overwrites a previous file (tar extraction
+				// uses O_TRUNC). This keeps disk usage bounded; the
+				// content still varies per iteration so the streaming
+				// payload isn't trivially compressible/dedupable.
 				i := writeIdx.Add(1)
-				name := fmt.Sprintf("file-%08d.txt", i)
+				name := fmt.Sprintf("file-%05d.txt", int(i)%stressWritePoolSize)
 				return stressTransferWriteFile(ctx, env, stressWriteDir, name, stressFileContent(int(i)))
 			},
 		},
