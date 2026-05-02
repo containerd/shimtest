@@ -74,11 +74,6 @@ func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
 
 	params := startShim(tb, shimBin, bundleDir, cid, shimtestNamespace, cfg)
 
-	var shimPID int
-	if data, err := os.ReadFile(filepath.Join(bundleDir, "shim.pid")); err == nil {
-		shimPID, _ = parseIntBytes(data)
-	}
-
 	conn := connectShim(tb, params.Address)
 	client := ttrpc.NewClient(conn)
 	tb.Cleanup(func() { client.Close() })
@@ -94,6 +89,18 @@ func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		tb.Fatal("failed to start task:", err)
+	}
+
+	// Ask the shim for its pid via the task service Connect RPC —
+	// authoritative and cross-platform. Now that the task is created,
+	// shims that gate Connect on task existence (e.g., nerdbox) will
+	// also respond. Falls back to shim.pid for shims that fail
+	// Connect entirely.
+	shimPID := 0
+	if pid, err := shimPidViaConnect(params.Address, cid, 1*time.Second); err == nil {
+		shimPID = pid
+	} else if data, err := os.ReadFile(filepath.Join(bundleDir, "shim.pid")); err == nil {
+		shimPID, _ = parseIntBytes(data)
 	}
 
 	return &shimEnv{

@@ -24,7 +24,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -205,22 +204,12 @@ const stressMaxRSSGrowth = 64 << 20 // 64 MiB
 // short-lived processes against it. RSS is sampled before and after
 // the loop; growth beyond stressMaxRSSGrowth fails the test.
 func (s *StressSuite) testExec(t *testing.T) {
-	beforePIDs := shimPIDs(t, s.cfg.ShimBinary)
 	env := newShimEnv(t, t.Context(), s.cfg)
 	defer shutdownShim(t, env.ctx, env)
 
 	pid := env.shimPID
 	if pid == 0 {
-		// Fall back to proc-scan diff: the new pid is the one that
-		// appeared between pre-env and post-env snapshots.
-		afterPIDs := shimPIDs(t, s.cfg.ShimBinary)
-		newPIDs := pidDiff(beforePIDs, afterPIDs)
-		if len(newPIDs) == 1 {
-			pid = newPIDs[0]
-		}
-	}
-	if pid == 0 {
-		t.Skip("skipping: cannot identify shim pid, RSS monitoring unavailable")
+		t.Skip("skipping: shim pid not available, RSS monitoring unavailable")
 	}
 
 	rssBefore, err := readRSS(pid)
@@ -331,64 +320,6 @@ func runOneExec(parentCtx context.Context, env *shimEnv, execID string, procSpec
 		return fmt.Errorf("delete exec: %w", err)
 	}
 	return nil
-}
-
-// readRSS returns the Resident Set Size of the given pid in bytes.
-// Reads /proc/<pid>/status (the VmRSS line, kB).
-func readRSS(pid int) (int64, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "VmRSS:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			break
-		}
-		kb, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		return kb * 1024, nil
-	}
-	return 0, fmt.Errorf("VmRSS not found in /proc/%d/status", pid)
-}
-
-// shimPIDs returns the set of currently-live shim processes whose
-// /proc/<pid>/exe symlink resolves to the same path as binary.
-// Returns an empty slice rather than an error on permission issues.
-func shimPIDs(t *testing.T, binary string) map[int]struct{} {
-	t.Helper()
-	target, err := filepath.EvalSymlinks(binary)
-	if err != nil {
-		// PATH-only resolution: try LookPath fallback handled in
-		// shimSetup; without an absolute path we can't compare. Bail
-		// without flagging.
-		t.Logf("cannot resolve shim binary path %q: %v (leak detection disabled)", binary, err)
-		return nil
-	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	pids := make(map[int]struct{})
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-		if err != nil {
-			continue
-		}
-		if exe == target {
-			pids[pid] = struct{}{}
-		}
-	}
-	return pids
 }
 
 // pidDiff returns PIDs in `after` that aren't in `before`.

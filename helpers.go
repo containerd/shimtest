@@ -37,6 +37,7 @@ import (
 	runcopt "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/fifo"
+	"github.com/containerd/ttrpc"
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -483,36 +484,87 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) boo
 		tb.Fatal("shim returned empty address")
 	}
 
-	var shimPid int
-	if data, err := os.ReadFile(filepath.Join(bundleDir, "shim.pid")); err == nil {
-		shimPid, _ = parseIntBytes(data)
-	}
-	if shimPid > 0 {
-		tb.Logf("shim pid: %d", shimPid)
-	}
-
 	tb.Cleanup(func() {
-		if shimPid <= 0 {
-			return
-		}
-		if syscall.Kill(shimPid, 0) != nil {
-			return
-		}
-		syscall.Kill(shimPid, syscall.SIGTERM)
-		for i := 0; i < 30; i++ {
-			time.Sleep(100 * time.Millisecond)
-			if syscall.Kill(shimPid, 0) != nil {
-				return
-			}
-		}
-		tb.Errorf("shim process %d did not exit after SIGTERM, sending SIGKILL", shimPid)
-		syscall.Kill(shimPid, syscall.SIGKILL)
-		if p, err := os.FindProcess(shimPid); err == nil {
-			p.Wait()
-		}
+		// Match containerd's cleanup behavior: invoke the shim binary's
+		// `delete` subcommand for protocol-prescribed bundle/runc/mount
+		// cleanup. The daemon itself exits via TTRPC Shutdown earlier
+		// in shutdownShim; if it didn't, containerd has no protocol
+		// method to kill it, so neither do we — leaks are surfaced by
+		// the StressSuite leak detector instead of papered over with
+		// SIGKILL on a potentially stale pid.
+		deleteShim(tb, shimBin, bundleDir, id, ns, cfg)
 	})
 
 	return params
+}
+
+// deleteShim invokes the shim binary's `delete` subcommand to perform
+// the protocol-prescribed bundle/runc/mount cleanup. This is what
+// containerd does to clean up "dead shim" state (see
+// core/runtime/v2/binary.go). Failures are logged but don't fail the
+// test — best-effort cleanup.
+func deleteShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) {
+	tb.Helper()
+	containerdAddr := containerdSockPath(tb, bundleDir)
+	args := []string{
+		"-namespace", ns,
+		"-id", id,
+		"-bundle", bundleDir,
+		"-address", containerdAddr,
+	}
+	if cfg.Debug {
+		args = append(args, "-debug")
+	}
+	args = append(args, "delete")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shimBin, args...)
+	cmd.Dir = bundleDir
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		tb.Logf("shim delete failed: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+}
+
+// shimPidViaConnect dials the shim's TTRPC address and asks for its
+// pid via the task service Connect RPC. Retries with a short backoff
+// for up to retryFor since the server may take a few milliseconds to
+// start accepting connections after the address is reported. Returns
+// the last error if the deadline is reached without a successful
+// response (some shims, e.g. nerdbox, return FailedPrecondition until
+// a task exists). Used by RSS monitoring in StressSuite, which calls
+// it after tc.Create when every conformant shim responds.
+func shimPidViaConnect(address, id string, retryFor time.Duration) (int, error) {
+	addr := strings.TrimPrefix(address, "unix://")
+	deadline := time.Now().Add(retryFor)
+	var lastErr error
+	for {
+		conn, err := net.Dial("unix", addr)
+		if err != nil {
+			lastErr = fmt.Errorf("dial: %w", err)
+		} else {
+			client := ttrpc.NewClient(conn)
+			tc := taskAPI.NewTTRPCTaskClient(client)
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			resp, callErr := tc.Connect(ctx, &taskAPI.ConnectRequest{ID: id})
+			cancel()
+			client.Close()
+			if callErr != nil {
+				lastErr = fmt.Errorf("Connect RPC: %w", callErr)
+			} else if resp.ShimPid == 0 {
+				lastErr = fmt.Errorf("Connect returned ShimPid=0")
+			} else {
+				return int(resp.ShimPid), nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return 0, lastErr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // parseIntBytes parses a decimal integer from a byte slice.
