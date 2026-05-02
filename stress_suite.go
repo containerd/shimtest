@@ -434,6 +434,25 @@ func (s *StressSuite) transferStressSubtests(t *testing.T, env *shimEnv) []stres
 		}
 	}
 
+	// Verify setup actually wrote all files. If the streaming layer
+	// silently dropped writes, the read goroutine below would surface
+	// the dropouts as "file not found" errors much later — a confusing
+	// failure mode. Surface it here instead.
+	missing := 0
+	for i := 0; i < stressReadPoolSize; i++ {
+		name := fmt.Sprintf("file-%05d.txt", i)
+		path := stressReadDir + "/" + name
+		if err := stressTransferStat(env.ctx, env, path); err != nil {
+			missing++
+			if missing <= 5 {
+				t.Logf("setup verify: missing %s: %v", name, err)
+			}
+		}
+	}
+	if missing > 0 {
+		t.Fatalf("setup verify: %d/%d read-pool files were not persisted by the shim", missing, stressReadPoolSize)
+	}
+
 	var writeIdx, readIdx atomic.Int64
 
 	return []stressSubtest{
@@ -570,10 +589,22 @@ func stressTransferReadFile(ctx context.Context, env *shimEnv, path, name string
 	}
 
 	var received bytes.Buffer
-	dst := transfer.NewWriteStream(&nopWriteCloser{&received}, "application/x-tar")
+	closed := make(chan struct{})
+	dst := transfer.NewWriteStream(&signalCloser{w: &received, done: closed}, "application/x-tar")
 
 	if err := stressDoTransfer(subCtx, env, src, dst); err != nil {
 		return "", err
+	}
+
+	// Wait for the WriteStream's MarshalAny goroutine to finish
+	// draining the stream into received. The Transfer RPC returning
+	// only confirms the server is done writing — the client-side
+	// io.Copy from stream into received runs in a separate goroutine
+	// that signals via the writer's Close.
+	select {
+	case <-closed:
+	case <-subCtx.Done():
+		return "", subCtx.Err()
 	}
 
 	tr := tar.NewReader(&received)
