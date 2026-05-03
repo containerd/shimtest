@@ -8,7 +8,7 @@ require (
 	github.com/containerd/continuity v0.4.6-0.20260414222450-94266266b24d
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/fifo v1.1.0
-	github.com/containerd/ttrpc v1.2.8
+	github.com/containerd/ttrpc v1.2.9-0.20260501231634-6c2eed2b612e
 	github.com/containerd/typeurl/v2 v2.2.3
 	github.com/erofs/go-erofs v0.3.0
 	github.com/opencontainers/runtime-spec v1.3.0
