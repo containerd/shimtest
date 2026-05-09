@@ -47,7 +47,7 @@ func openTestbin() (io.Reader, error) {
 // testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command in the embedded
 // rootfs.
-var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "hashverify", "memhog", "nc", "tickexit"}
+var testbinCommands = []string{"forever", "cat", "date", "echo", "exit", "hashverify", "layercheck", "ls", "memhog", "nc", "tickexit"}
 
 // bigFileSize is the size of the IO benchmark fixture file. Large
 // enough to swamp small per-call overheads while still building /
@@ -388,6 +388,114 @@ func buildOverlayMounts(tb testing.TB, lower string) []*types.Mount {
 			"lowerdir=" + lower,
 		},
 	}}
+}
+
+// overlayWhiteoutMode is the unix mode for an overlayfs whiteout
+// entry: a character device with type bits S_IFCHR (0o20000) and
+// permission 0. Combined with rdev = 0 (major:minor 0:0), this is
+// what the kernel overlayfs driver recognizes as a whiteout in any
+// lower layer.
+const overlayWhiteoutMode = 0o20000
+
+// writeLayersErofs builds n erofs layer images that stack on top of
+// the testbin rootfs (writeRootfsErofs) to exercise multi-layer
+// overlay handling. The structure is:
+//
+//   - Layer 1 (the bottom of the n new layers): seeds /base with
+//     n-1 regular files (base_0 .. base_{n-2}, each containing
+//     "base J\n") and adds /added/file_1 ("layer 1\n").
+//   - Layers 2..n: each adds /added/file_K ("layer K\n") and writes
+//     an overlayfs whiteout for /base/base_{K-2} (a char device with
+//     rdev 0:0 — the standard "remove this from lower layers" marker).
+//
+// After all n layers are stacked above the rootfs, the visible
+// filesystem contains all n /added/file_K files and an empty /base.
+//
+// The returned slice is ordered top-first so it can be passed
+// directly as the erofsImgs argument to buildErofsMounts: index 0 is
+// layer n (highest priority, applied last), index n-1 is layer 1
+// (lowest priority, applied first).
+func writeLayersErofs(tb testing.TB, n int) []string {
+	tb.Helper()
+	if n < 2 {
+		tb.Fatalf("writeLayersErofs: n=%d must be >= 2", n)
+	}
+
+	dir := tb.TempDir()
+	paths := make([]string, n)
+
+	// Layer 1: seeds /base with n-1 files and adds /added/file_1.
+	{
+		imgPath := filepath.Join(dir, "layer-001.erofs")
+		f, err := os.Create(imgPath)
+		if err != nil {
+			tb.Fatal("create layer 1 erofs:", err)
+		}
+
+		w := erofs.Create(f)
+
+		if err := w.Mkdir("base", 0755); err != nil {
+			tb.Fatal("mkdir base:", err)
+		}
+		for k := 0; k < n-1; k++ {
+			writeErofsFile(tb, w, fmt.Sprintf("base/base_%d", k), []byte(fmt.Sprintf("base %d\n", k)))
+		}
+
+		if err := w.Mkdir("added", 0755); err != nil {
+			tb.Fatal("mkdir added:", err)
+		}
+		writeErofsFile(tb, w, "added/file_1", []byte("layer 1\n"))
+
+		if err := w.Close(); err != nil {
+			tb.Fatal("close layer 1 erofs:", err)
+		}
+		if err := f.Close(); err != nil {
+			tb.Fatal("close layer 1 file:", err)
+		}
+		// Layer 1 is the bottommost lower → last entry (lowest priority).
+		paths[n-1] = imgPath
+	}
+
+	// Layers 2..n: each adds one file to /added and whites out one
+	// file from /base. Layer K removes base_{K-2} so that across
+	// layers 2..n the whiteouts cover base_0..base_{n-2}.
+	for k := 2; k <= n; k++ {
+		imgPath := filepath.Join(dir, fmt.Sprintf("layer-%03d.erofs", k))
+		f, err := os.Create(imgPath)
+		if err != nil {
+			tb.Fatalf("create layer %d erofs: %v", k, err)
+		}
+
+		w := erofs.Create(f)
+
+		if err := w.Mkdir("added", 0755); err != nil {
+			tb.Fatalf("mkdir added (layer %d): %v", k, err)
+		}
+		writeErofsFile(tb, w, fmt.Sprintf("added/file_%d", k), []byte(fmt.Sprintf("layer %d\n", k)))
+
+		if err := w.Mkdir("base", 0755); err != nil {
+			tb.Fatalf("mkdir base (layer %d): %v", k, err)
+		}
+		// Overlayfs whiteout: char device 0:0. mknod with type bits
+		// S_IFCHR and rdev = 0 makes the kernel hide base_{k-2} in
+		// every lower layer below this one.
+		if err := w.Mknod(fmt.Sprintf("base/base_%d", k-2), overlayWhiteoutMode, 0); err != nil {
+			tb.Fatalf("mknod whiteout (layer %d): %v", k, err)
+		}
+
+		if err := w.Close(); err != nil {
+			tb.Fatalf("close layer %d erofs: %v", k, err)
+		}
+		if err := f.Close(); err != nil {
+			tb.Fatalf("close layer %d file: %v", k, err)
+		}
+		// Top-first ordering: higher k = newer layer = higher
+		// priority = earlier in slice. Layer n at index 0, layer 2
+		// at index n-2.
+		paths[n-k] = imgPath
+	}
+
+	return paths
 }
 
 // buildErofsMounts builds the layered erofs layout: ext4 (rw scratch)

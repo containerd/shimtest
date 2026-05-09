@@ -38,7 +38,7 @@ Tests are driven by one or more JSON configuration files. See
 | `uid` | int | UID to run as; defaults to the current user's UID. If set to a value different from the current UID and the effective UID is 0, the harness re-execs itself as that user via `sudo` |
 | `gid` | int | GID to run as |
 | `format_mounts` | bool | Provide the rootfs as formatted erofs/ext4 images with a `format/mkdir/overlay` descriptor for the shim to mount. Default (`false`) extracts the rootfs and provides a pre-mounted overlay (or plain directory when rootless) |
-| `skip` | []string | Feature names to skip (`exec`, `oom`, `transfer`, `uds`) |
+| `skip` | []string | Feature names to skip (`exec`, `layers`, `oom`, `transfer`, `uds`) |
 | `env` | map | Additional environment variables for the test run |
 | `debug` | bool | Enable debug logging on the shim |
 
@@ -100,6 +100,7 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `LargeFileRead` | exec | Read a 64 MiB fixture from a secondary read-only erofs layer, verify crc32-Castagnoli, report MiB/s |
 | `BindMountRead` | exec | Bind-mount the same 64 MiB fixture from a host tempfile and verify+benchmark via the bind path |
 | `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |
+| `HundredLayers` | layers | Build a rootfs with 100 stacked erofs layers — layer 1 seeds 99 files in `/base` and adds `/added/file_1`; layers 2..100 each add `/added/file_K` and white out `/base/base_{K-2}`. Verify all 100 added files are present and all 99 base files are gone. Only meaningful with `format_mounts=true` (the shim assembles the multi-layer overlay itself); skipped otherwise |
 | `TransferCopyTo` | transfer | Copy a file into a container |
 | `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
 | `TransferExecVerify` | transfer | Copy a file in, verify via exec |
@@ -142,6 +143,7 @@ Benchmarks live under `BenchmarkShim/<config-name>/<bench-name>`.
 | `Exec` | exec | Exec cycle inside a running container (exec/start/wait/delete) |
 | `StdioRoundTrip` | exec | Stdio write/read at 8B, 4KB, 4MB |
 | `UDSRoundTrip` | uds | UDS forwarded-socket throughput in both directions (HostToContainer, ContainerToHost) at 8B, 4KB, 4MB |
+| `ThirtyLayers` | layers | Bring up a container with a 30-layer erofs rootfs (same shape as `HundredLayers`, smaller). Reports per-phase metrics (`ms/shim-start`, `ms/create`, `ms/task-start`, `ms/total`) so multi-layer mount overhead can be localized. Requires `format_mounts=true` |
 
 ## Using shimtest in your shim's CI
 
@@ -223,9 +225,10 @@ unbounded `Stress` run, and run active fuzzing as its own step:
 - **`uid`**: omit to run as the runner user. Set explicitly when you
   want the harness to `sudo` re-exec itself or rewrite the profile.
 - **`skip`**: list of feature names to disable. Currently meaningful
-  values are `exec`, `oom`, `transfer`, and `uds` — useful when your
-  shim doesn't implement transfer/UDS forwarding or when running
-  rootless without cgroup delegation.
+  values are `exec`, `layers`, `oom`, `transfer`, and `uds` — useful
+  when your shim doesn't implement transfer/UDS forwarding,
+  multi-layer rootfs descriptors, or when running rootless without
+  cgroup delegation.
 
 ### Multiple configs
 

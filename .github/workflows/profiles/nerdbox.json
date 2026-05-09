@@ -1,4 +1,5 @@
 {
   "shim_binary": "containerd-shim-nerdbox-v1",
-  "format_mounts": true
+  "format_mounts": true,
+  "skip": ["layers"]
 }

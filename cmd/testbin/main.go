@@ -3,7 +3,8 @@
 // test suite, invoked either directly (testbin <cmd> [args...]) or
 // via symlink (e.g. /bin/cat -> /bin/testbin).
 //
-// Commands: forever, cat, date, echo, exit, hashverify, memhog, nc, tickexit
+// Commands: forever, cat, date, echo, exit, hashverify, layercheck,
+// ls, memhog, nc, tickexit
 package main
 
 import (
@@ -50,6 +51,10 @@ func main() {
 		cmdExit(args)
 	case "hashverify":
 		cmdHashverify(args)
+	case "layercheck":
+		cmdLayercheck(args)
+	case "ls":
+		cmdLs(args)
 	case "memhog":
 		cmdMemhog(args)
 	case "nc":
@@ -211,6 +216,116 @@ func cmdHashverify(args []string) {
 	}
 
 	fmt.Printf("ok bytes=%d ns=%d cpu_bound=%d\n", total, elapsed.Nanoseconds(), cpuBound)
+}
+
+// cmdLayercheck verifies the contents of a layered overlay rootfs
+// produced by the shimtest LayersSuite test fixtures.
+//
+// Usage: layercheck <addedDir> <addedCount> <baseDir> <baseCount>
+//
+// Verifies that:
+//   - <addedDir>/file_K exists and contains "layer K\n" for K in 1..addedCount
+//   - <baseDir>/base_J does not exist for J in 0..baseCount-1
+//   - <baseDir> exists and is empty (no leftover entries)
+//
+// On success prints "ok added=<n> base_missing=<m>" to stdout. On
+// any mismatch it prints diagnostic lines to stderr and exits 1.
+// Argument parse errors exit 2.
+func cmdLayercheck(args []string) {
+	if len(args) < 5 {
+		fmt.Fprintln(os.Stderr, "usage: layercheck <addedDir> <addedCount> <baseDir> <baseCount>")
+		os.Exit(2)
+	}
+	addedDir := args[1]
+	addedCount, err := strconv.Atoi(args[2])
+	if err != nil || addedCount < 0 {
+		fmt.Fprintf(os.Stderr, "layercheck: invalid addedCount %q\n", args[2])
+		os.Exit(2)
+	}
+	baseDir := args[3]
+	baseCount, err := strconv.Atoi(args[4])
+	if err != nil || baseCount < 0 {
+		fmt.Fprintf(os.Stderr, "layercheck: invalid baseCount %q\n", args[4])
+		os.Exit(2)
+	}
+
+	failures := 0
+
+	// Verify each added file is present with the expected content.
+	for i := 1; i <= addedCount; i++ {
+		path := filepath.Join(addedDir, fmt.Sprintf("file_%d", i))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "missing added: %s: %v\n", path, err)
+			failures++
+			continue
+		}
+		want := fmt.Sprintf("layer %d\n", i)
+		if string(data) != want {
+			fmt.Fprintf(os.Stderr, "content mismatch %s: got %q, want %q\n", path, string(data), want)
+			failures++
+		}
+	}
+
+	// Verify each base file is absent.
+	for j := 0; j < baseCount; j++ {
+		path := filepath.Join(baseDir, fmt.Sprintf("base_%d", j))
+		_, err := os.Lstat(path)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "base file still present: %s\n", path)
+			failures++
+			continue
+		}
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "stat %s: %v\n", path, err)
+			failures++
+		}
+	}
+
+	// Verify base dir exists and contains no leftover entries.
+	if entries, err := os.ReadDir(baseDir); err != nil {
+		fmt.Fprintf(os.Stderr, "readdir %s: %v\n", baseDir, err)
+		failures++
+	} else if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		fmt.Fprintf(os.Stderr, "base dir %s not empty: %v\n", baseDir, names)
+		failures++
+	}
+
+	if failures > 0 {
+		fmt.Fprintf(os.Stderr, "layercheck: %d failure(s)\n", failures)
+		os.Exit(1)
+	}
+
+	fmt.Printf("ok added=%d base_missing=%d\n", addedCount, baseCount)
+}
+
+// cmdLs lists directory contents, printing one entry name per line.
+// Usage: ls [<dir>...]
+// Exits 1 if any directory cannot be read.
+func cmdLs(args []string) {
+	dirs := args[1:]
+	if len(dirs) == 0 {
+		dirs = []string{"."}
+	}
+	exitCode := 0
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ls: %s: %v\n", dir, err)
+			exitCode = 1
+			continue
+		}
+		for _, e := range entries {
+			fmt.Println(e.Name())
+		}
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
 // cmdExit parses its first argument as an integer status and exits

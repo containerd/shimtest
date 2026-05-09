@@ -54,6 +54,9 @@ func TestShim(t *testing.T) {
 			if !featureSkipped("oom") {
 				shimtest.NewOOMSuite(c).Run(t)
 			}
+			if !featureSkipped("layers") {
+				shimtest.NewLayersSuite(c).Run(t)
+			}
 			t.Run("Stress", shimtest.NewStressSuite(c, shimtest.StressOptions{
 				Transfer: !featureSkipped("transfer"),
 			}).Run)
@@ -63,8 +66,8 @@ func TestShim(t *testing.T) {
 
 // BenchmarkShim is the top-level benchmark runner. For each
 // configured profile it activates the config, then dispatches to
-// each suite that has benchmarks (RunSuite, ExecSuite, UDSSuite),
-// gated on the same Skip list as TestShim.
+// each suite that has benchmarks (RunSuite, ExecSuite, UDSSuite,
+// LayersSuite), gated on the same Skip list as TestShim.
 func BenchmarkShim(b *testing.B) {
 	for _, name := range sortedConfigNames() {
 		cfg := testConfigs[name]
@@ -82,6 +85,9 @@ func BenchmarkShim(b *testing.B) {
 			}
 			if !featureSkipped("uds") {
 				shimtest.NewUDSSuite(c).Bench(b)
+			}
+			if !featureSkipped("layers") {
+				shimtest.NewLayersSuite(c).Bench(b)
 			}
 		})
 	}
