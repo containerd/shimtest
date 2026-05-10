@@ -18,7 +18,6 @@ package shimtest
 
 import (
 	"context"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +27,13 @@ import (
 	"github.com/containerd/ttrpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// eventRecorders caches the recorder per bundleDir so that
+// startEventsRecorder is idempotent: shimSetup binds one preemptively
+// (so the shim's event publishes never hang on a missing pipe server),
+// and tests that need a reference for assertions get the same instance
+// instead of trying to create a second listener on the same path.
+var eventRecorders sync.Map // map[string]*eventRecorder
 
 // eventRecorder implements the containerd ttrpc events service and
 // records every envelope it receives. Shims push events to this
@@ -78,18 +84,26 @@ func (r *eventRecorder) waitForTopic(topic string, timeout time.Duration) *types
 }
 
 // startEventsRecorder binds a TTRPC events server to the socket path
-// the shim dials as its events endpoint (bundleDir/c.sock) and
-// returns a recorder capturing every forwarded envelope. Must be
-// called before startShim so the shim's first publish succeeds.
+// the shim dials as its events endpoint and returns a recorder
+// capturing every forwarded envelope. Must be called before startShim
+// so the shim's first publish succeeds.
+//
+// Idempotent per bundleDir: if a recorder has already been started for
+// this bundleDir (e.g. by shimSetup), returns the existing instance
+// instead of trying to bind a second listener on the same address —
+// which would fail with EADDRINUSE on Unix and ACCESS_DENIED on Windows.
 func startEventsRecorder(tb testing.TB, bundleDir string) *eventRecorder {
 	tb.Helper()
 
+	if v, ok := eventRecorders.Load(bundleDir); ok {
+		return v.(*eventRecorder)
+	}
+
 	socketPath := containerdSockPath(tb, bundleDir)
 
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		tb.Fatal("events listen:", err)
-	}
+	// listenEvents is platform-specific (connect_unix.go / connect_windows.go):
+	// Unix uses net.Listen("unix",...); Windows uses winio.ListenPipe.
+	ln := listenEvents(tb, socketPath)
 
 	srv, err := ttrpc.NewServer()
 	if err != nil {
@@ -100,9 +114,12 @@ func startEventsRecorder(tb testing.TB, bundleDir string) *eventRecorder {
 	rec := &eventRecorder{}
 	eventsapi.RegisterTTRPCEventsService(srv, rec)
 
+	eventRecorders.Store(bundleDir, rec)
+
 	go srv.Serve(context.Background(), ln)
 
 	tb.Cleanup(func() {
+		eventRecorders.Delete(bundleDir)
 		srv.Close()
 		ln.Close()
 	})

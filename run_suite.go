@@ -30,7 +30,6 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
 )
@@ -82,31 +81,8 @@ func (s *RunSuite) testLifecycle(t *testing.T) {
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
-	stdoutFifo, err := fifo.OpenFifo(ctx, stdoutPath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		t.Fatal("failed to open stdout fifo:", err)
-	}
-	defer stdoutFifo.Close()
-	stderrFifo, err := fifo.OpenFifo(ctx, stderrPath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		t.Fatal("failed to open stderr fifo:", err)
-	}
-	defer stderrFifo.Close()
-
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := stdoutFifo.Read(buf)
-			if n > 0 {
-				stdoutMu.Lock()
-				stdoutBuf.Write(buf[:n])
-				stdoutMu.Unlock()
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	drainFifoInto(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
+	drainFifo(t, ctx, stderrPath)
 
 	t.Log("creating task")
 	createResp, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts))

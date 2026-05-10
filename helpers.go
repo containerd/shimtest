@@ -21,13 +21,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -36,7 +35,6 @@ import (
 	"github.com/containerd/containerd/api/types"
 	runcopt "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -137,19 +135,6 @@ func containerID(tb testing.TB) string {
 	return strings.ToLower(name) + "-" + randomSuffix()
 }
 
-// randomSuffix returns a short random hex string. Used to give test
-// runs unique identifiers (container ids, tmp dirs).
-func randomSuffix() string {
-	b := make([]byte, 4)
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
-		return "0000"
-	}
-	defer f.Close()
-	f.Read(b)
-	return fmt.Sprintf("%x", b)
-}
-
 // createOCISpec writes a minimal OCI spec config.json under
 // bundleDir. Each opt is applied in order before the spec is
 // written. When the process is rootless and the rootfs isn't being
@@ -246,7 +231,7 @@ func shimSetup(tb testing.TB, cfg Config) (shimBin, bundleDir string, rootfsMoun
 	// helpers (kernels, libraries) co-located with the shim resolve.
 	shimDir := filepath.Dir(shimBin)
 	if !strings.Contains(os.Getenv("PATH"), shimDir) {
-		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+		os.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
 
 	bundleDir = tb.TempDir()
@@ -263,121 +248,35 @@ func shimSetup(tb testing.TB, cfg Config) (shimBin, bundleDir string, rootfsMoun
 
 	rootfsMounts = buildEmbeddedRootfs(tb, bundleDir, cfg)
 
+	// Always start an events recorder so the shim's event-publish connection
+	// never blocks. On Linux, a missing events socket causes an immediate
+	// "connection refused" which shims handle gracefully. On Windows, a missing
+	// named-pipe server causes DialPipe to retry for several seconds (or
+	// indefinitely), deadlocking the Create RPC. Binding the server here
+	// ensures it exists before the shim needs it, regardless of which suite
+	// method is running.
+	startEventsRecorder(tb, bundleDir)
+
 	return shimBin, bundleDir, rootfsMounts
 }
 
-// shortSocketPaths caches the short-path mapping so multiple calls to
-// ContainerdSockPath for the same bundleDir return the same path.
+// shortSocketPaths caches the events-socket path per bundleDir so that
+// all callers within a single test get the same address. The concrete
+// implementation of containerdSockPath (unix socket vs. named pipe) lives
+// in connect_unix.go / connect_windows.go.
 var shortSocketPaths sync.Map
 
-// containerdSockPath returns the unix socket path the shim dials as
-// its containerd events endpoint. On macOS, AF_UNIX paths are limited
-// to 104 bytes, so a short /tmp path is used when the bundle is too
-// deep. The result is cached per bundleDir so all callers within a
-// single test get the same path.
-func containerdSockPath(tb testing.TB, bundleDir string) string {
-	tb.Helper()
-	candidate := filepath.Join(bundleDir, "c.sock")
-	if len(candidate) <= 104 {
-		return candidate
-	}
-	if v, ok := shortSocketPaths.Load(bundleDir); ok {
-		return v.(string)
-	}
-	dir, err := os.MkdirTemp("/tmp", "nb-ev-")
-	if err != nil {
-		tb.Fatal("create short socket dir:", err)
-	}
-	p := filepath.Join(dir, "c.sock")
-	shortSocketPaths.Store(bundleDir, p)
-	tb.Cleanup(func() {
-		shortSocketPaths.Delete(bundleDir)
-		os.RemoveAll(dir)
-	})
-	return p
-}
 
-// createIOFifos creates stdout and stderr FIFOs in dir.
-func createIOFifos(tb testing.TB, dir string) (stdoutPath, stderrPath string) {
-	tb.Helper()
-	stdoutPath = filepath.Join(dir, "stdout")
-	stderrPath = filepath.Join(dir, "stderr")
-	if err := syscall.Mkfifo(stdoutPath, 0600); err != nil {
-		tb.Fatal("failed to create stdout fifo:", err)
-	}
-	if err := syscall.Mkfifo(stderrPath, 0600); err != nil {
-		tb.Fatal("failed to create stderr fifo:", err)
-	}
-	return
-}
-
-// createStdioFifos creates stdin, stdout, and stderr FIFOs in dir.
-func createStdioFifos(tb testing.TB, dir string) (stdinPath, stdoutPath, stderrPath string) {
-	tb.Helper()
-	stdinPath = filepath.Join(dir, "stdin")
-	stdoutPath = filepath.Join(dir, "stdout")
-	stderrPath = filepath.Join(dir, "stderr")
-	if err := syscall.Mkfifo(stdinPath, 0600); err != nil {
-		tb.Fatal("failed to create stdin fifo:", err)
-	}
-	if err := syscall.Mkfifo(stdoutPath, 0600); err != nil {
-		tb.Fatal("failed to create stdout fifo:", err)
-	}
-	if err := syscall.Mkfifo(stderrPath, 0600); err != nil {
-		tb.Fatal("failed to create stderr fifo:", err)
-	}
-	return
-}
-
-// drainFifo opens a FIFO for reading and discards all data in a
-// background goroutine. Closes on tb cleanup.
-func drainFifo(tb testing.TB, ctx context.Context, path string) {
-	tb.Helper()
-	f, err := fifo.OpenFifo(ctx, path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		tb.Fatal("failed to open fifo:", err)
-	}
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			if _, err := f.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
-	tb.Cleanup(func() { f.Close() })
-}
-
-// drainFifoInto opens a FIFO for reading and copies data into buf
-// (protected by mu).
-func drainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.Buffer, mu *sync.Mutex) {
-	tb.Helper()
-	f, err := fifo.OpenFifo(ctx, path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		tb.Fatal("failed to open fifo:", err)
-	}
-	go func() {
-		b := make([]byte, 4096)
-		for {
-			n, err := f.Read(b)
-			if n > 0 {
-				mu.Lock()
-				buf.Write(b[:n])
-				mu.Unlock()
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	tb.Cleanup(func() { f.Close() })
-}
 
 // newCreateTaskRequest builds a CreateTaskRequest with runc Options.
 // SystemdCgroup is forced off so root and rootless runs both use the
 // cgroupfs manager — otherwise root on systemd hosts pays tens of ms
 // of DBus round-trips per container, skewing benchmarks. Rootless
-// paths additionally get IoUid/IoGid set and a writable Root.
+// (Linux non-root) paths additionally get IoUid/IoGid set and a writable
+// Root. On Windows, where containers run inside a VM as root, none of
+// the rootless tweaks apply (and os.Getuid returns -1, which would
+// otherwise trigger the rootless branch and pass a Windows path as
+// runc's --root, which then fails inside the Linux VM).
 func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, rootfs []*types.Mount) *taskAPI.CreateTaskRequest {
 	tb.Helper()
 	req := &taskAPI.CreateTaskRequest{
@@ -388,14 +287,16 @@ func newCreateTaskRequest(tb testing.TB, id, bundle, stdout, stderr string, root
 		Rootfs: rootfs,
 	}
 	opts := &runcopt.Options{SystemdCgroup: false}
-	uid := os.Getuid()
-	gid := os.Getgid()
-	if uid != 0 {
-		runcRoot := filepath.Join(os.TempDir(), "shimtest-runc")
-		os.MkdirAll(runcRoot, 0700)
-		opts.IoUid = uint32(uid)
-		opts.IoGid = uint32(gid)
-		opts.Root = runcRoot
+	if runtime.GOOS != "windows" {
+		uid := os.Getuid()
+		gid := os.Getgid()
+		if uid > 0 {
+			runcRoot := filepath.Join(os.TempDir(), "shimtest-runc")
+			os.MkdirAll(runcRoot, 0700)
+			opts.IoUid = uint32(uid)
+			opts.IoGid = uint32(gid)
+			opts.Root = runcRoot
+		}
 	}
 	any, err := typeurl.MarshalAnyToProto(opts)
 	if err != nil {
@@ -465,20 +366,18 @@ func parseBootstrapResult(data []byte, params *bootstrapParams) error {
 func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) bootstrapParams {
 	tb.Helper()
 
-	socketDir, err := os.MkdirTemp("/tmp", "nb-")
+	socketDir, err := os.MkdirTemp("", "nb-")
 	if err != nil {
 		tb.Fatal("failed to create socket dir:", err)
 	}
 	tb.Cleanup(func() { os.RemoveAll(socketDir) })
 
-	logPath := filepath.Join(bundleDir, "log")
-	if err := syscall.Mkfifo(logPath, 0700); err != nil {
-		tb.Fatal("failed to create log fifo:", err)
-	}
-	logFifo, err := fifo.OpenFifo(context.Background(), logPath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		tb.Fatal("failed to open log fifo:", err)
-	}
+	// setupLogPipe is platform-specific (io_unix.go / io_windows.go).
+	// On Linux it creates bundleDir/log as a FIFO for the shim to write to.
+	// On Windows it dials \\.\pipe\containerd-shim-<ns>-<id>-log, which the
+	// shim creates as a server — mirroring containerd's shim_windows.go.
+	logReader := setupLogPipe(tb, bundleDir, ns, id)
+
 	// Buffer shim logs and only dump them on test failure.
 	// Benchmarks always discard.
 	_, isBench := tb.(*testing.B)
@@ -488,7 +387,7 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) boo
 		defer close(done)
 		buf := make([]byte, 32768)
 		for {
-			n, err := logFifo.Read(buf)
+			n, err := logReader.Read(buf)
 			if n > 0 && !isBench {
 				logBuf.Write(buf[:n])
 			}
@@ -509,7 +408,7 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) boo
 		})
 	}
 	tb.Cleanup(func() {
-		logFifo.Close()
+		logReader.Close()
 		<-done
 	})
 
@@ -616,12 +515,13 @@ func deleteShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) {
 // response (some shims, e.g. nerdbox, return FailedPrecondition until
 // a task exists). Used by RSS monitoring in StressSuite, which calls
 // it after tc.Create when every conformant shim responds.
+//
+// dialShimConn is platform-specific (connect_unix.go / connect_windows.go).
 func shimPidViaConnect(address, id string, retryFor time.Duration) (int, error) {
-	addr := strings.TrimPrefix(address, "unix://")
 	deadline := time.Now().Add(retryFor)
 	var lastErr error
 	for {
-		conn, err := net.Dial("unix", addr)
+		conn, err := dialShimConn(address, 500*time.Millisecond)
 		if err != nil {
 			lastErr = fmt.Errorf("dial: %w", err)
 		} else {
@@ -659,14 +559,4 @@ func parseIntBytes(b []byte) (int, error) {
 	return n, nil
 }
 
-// connectShim dials the shim's TTRPC unix socket.
-func connectShim(tb testing.TB, address string) net.Conn {
-	tb.Helper()
-	addr := strings.TrimPrefix(address, "unix://")
-	conn, err := net.Dial("unix", addr)
-	if err != nil {
-		tb.Fatalf("failed to connect to shim at %s: %v", addr, err)
-	}
-	tb.Cleanup(func() { conn.Close() })
-	return conn
-}
+

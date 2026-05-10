@@ -28,7 +28,6 @@ import (
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -96,15 +95,15 @@ func (s *UDSSuite) benchUDSRoundTrip(b *testing.B) {
 	execDir := b.TempDir()
 	execStdin, execStdout, execStderr := createStdioFifos(b, execDir)
 
-	stdinFifo, err := fifo.OpenFifo(ctx, execStdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+	stdinFifo, err := openPipeWriter(ctx, execStdin)
 	if err != nil {
-		b.Fatal("open stdin fifo:", err)
+		b.Fatal("open stdin pipe:", err)
 	}
 	defer stdinFifo.Close()
 
-	stdoutFifo, err := fifo.OpenFifo(ctx, execStdout, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	stdoutFifo, err := openPipeReader(ctx, execStdout)
 	if err != nil {
-		b.Fatal("open stdout fifo:", err)
+		b.Fatal("open stdout pipe:", err)
 	}
 	defer stdoutFifo.Close()
 

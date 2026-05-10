@@ -31,7 +31,6 @@ import (
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -188,9 +187,9 @@ func (s *ExecSuite) testStdioRoundTrip(t *testing.T) {
 	drainFifoInto(t, ctx, execStdout, &execBuf, &execMu)
 	drainFifo(t, ctx, execStderr)
 
-	stdinFifo, err := fifo.OpenFifo(ctx, execStdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+	stdinFifo, err := openPipeWriter(ctx, execStdin)
 	if err != nil {
-		t.Fatal("open stdin fifo:", err)
+		t.Fatal("open stdin pipe:", err)
 	}
 	defer stdinFifo.Close()
 
