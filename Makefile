@@ -1,7 +1,12 @@
 GO ?= go
 GO_BUILDTAGS ?=
 GO_TAGS = $(if $(GO_BUILDTAGS),-tags "$(strip $(GO_BUILDTAGS))",)
+# On Windows the test binary must have the .exe extension to be executable.
+ifeq ($(OS),Windows_NT)
+TEST_BINARY = _output/shimtest.exe
+else
 TEST_BINARY = _output/shimtest.test
+endif
 TESTBIN_OUT = _output/testbin.gz
 
 # Target OS/arch for testbin. Defaults to linux/amd64.
@@ -40,12 +45,12 @@ help:
 	@echo "$(TESTBIN_OUT) before running make build."
 	@echo ""
 	@echo "Running tests:"
-	@echo "  sudo $(TEST_BINARY) -test.v -test.timeout=120s -shimtest.config=<config.json>"
+	@echo "  $(TEST_BINARY) -test.v -test.timeout=120s -shimtest.config=<config.json>"
 	@echo ""
 	@echo "Running benchmarks:"
-	@echo "  sudo $(TEST_BINARY) -test.run=^$$ -test.bench=. -test.timeout=300s -shimtest.config=<config.json>"
+	@echo "  $(TEST_BINARY) -test.run=^$$ -test.bench=. -test.timeout=300s -shimtest.config=<config.json>"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build"
-	@echo "  sudo _output/shimtest.test -test.v -test.timeout=120s -shimtest.config=profiles/myconfig.json"
-	@echo "  sudo _output/shimtest.test -test.run=^$$ -test.bench=BenchmarkShim -test.count=3 -test.timeout=300s -shimtest.config=profiles/myconfig.json"
+	@echo "  $(TEST_BINARY) -test.v -test.timeout=120s -shimtest.config=profiles/myconfig.json"
+	@echo "  $(TEST_BINARY) -test.run=^$$ -test.bench=BenchmarkShim -test.count=3 -test.timeout=300s -shimtest.config=profiles/myconfig.json"
