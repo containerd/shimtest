@@ -131,14 +131,19 @@ func bigFileHashHex() string {
 func writeBigFileErofs(tb testing.TB) string {
 	tb.Helper()
 
-	imgPath := filepath.Join(tb.TempDir(), "bigfile.erofs")
+	// Use the same dir for the image and the erofs spool file so that
+	// t.TempDir()'s cleanup removes both. Without WithTempDir, the spool
+	// lands in os.TempDir() and the Unix unlink-while-open trick that
+	// go-erofs relies on fails silently on Windows, leaving files behind.
+	dir := tb.TempDir()
+	imgPath := filepath.Join(dir, "bigfile.erofs")
 	f, err := os.Create(imgPath)
 	if err != nil {
 		tb.Fatal("create bigfile erofs:", err)
 	}
 	defer f.Close()
 
-	w := erofs.Create(f)
+	w := erofs.Create(f, erofs.WithTempDir(dir))
 
 	if err := w.Mkdir("data", 0755); err != nil {
 		tb.Fatal("mkdir data:", err)
@@ -189,14 +194,19 @@ func writeBigFileErofs(tb testing.TB) string {
 func writeRootfsErofs(tb testing.TB) string {
 	tb.Helper()
 
-	imgPath := filepath.Join(tb.TempDir(), "rootfs.erofs")
+	// Use the same dir for the image and the erofs spool file so that
+	// t.TempDir()'s cleanup removes both. Without WithTempDir, the spool
+	// lands in os.TempDir() and the Unix unlink-while-open trick that
+	// go-erofs relies on fails silently on Windows, leaving files behind.
+	dir := tb.TempDir()
+	imgPath := filepath.Join(dir, "rootfs.erofs")
 	f, err := os.Create(imgPath)
 	if err != nil {
 		tb.Fatal("create erofs image:", err)
 	}
 	defer f.Close()
 
-	w := erofs.Create(f)
+	w := erofs.Create(f, erofs.WithTempDir(dir))
 
 	for _, d := range []string{"bin", "dev", "etc", "proc", "run", "sys", "tmp"} {
 		if err := w.Mkdir(d, 0755); err != nil {
