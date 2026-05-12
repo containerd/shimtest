@@ -19,6 +19,9 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +29,7 @@ import (
 	"time"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/ttrpc"
 )
@@ -46,6 +50,17 @@ func (s *RunSuite) Bench(b *testing.B) {
 // start. Per-phase durations are reported as custom metrics so
 // regressions can be localized to a specific RPC.
 func (s *RunSuite) benchLifecycle(b *testing.B) {
+	// Build the read-only erofs images once; per-iteration setup only
+	// creates the writable ext4 scratch image (or overlay upper/work).
+	shimBin, err := exec.LookPath(s.cfg.ShimBinary)
+	if err != nil {
+		b.Fatalf("shim binary %q not found in PATH: %v", s.cfg.ShimBinary, err)
+	}
+	if shimDir := filepath.Dir(shimBin); !strings.Contains(os.Getenv("PATH"), shimDir) {
+		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	}
+	imgs := buildShimImages(b, s.cfg)
+
 	base := containerID(b)
 	ns := shimtestNamespace
 
@@ -55,7 +70,19 @@ func (s *RunSuite) benchLifecycle(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		cid := fmt.Sprintf("%s-%d", base, i)
-		shimBin, bundleDir, rootfsMounts := shimSetup(b, s.cfg)
+
+		bundleDir := b.TempDir()
+		bundleDir, err = filepath.EvalSymlinks(bundleDir)
+		if err != nil {
+			b.Fatal("resolve bundle dir:", err)
+		}
+		rootfsDir := filepath.Join(bundleDir, "rootfs")
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			b.Fatal("mkdir rootfs:", err)
+		}
+		b.Cleanup(func() { mount.Unmount(rootfsDir, 0) })
+		rootfsMounts := buildRootfsMountsFromImages(b, s.cfg, imgs, rootfsDir)
+
 		createOCISpec(b, bundleDir, []string{"/bin/forever", "hello"}, s.cfg)
 		stdoutPath, stderrPath := createIOFifos(b, bundleDir)
 		ctx := namespaces.WithNamespace(b.Context(), ns)
@@ -124,6 +151,15 @@ func (s *RunSuite) benchLifecycle(b *testing.B) {
 // benchStartup measures the time from shim start through the first
 // output being produced by the container process.
 func (s *RunSuite) benchStartup(b *testing.B) {
+	shimBin, err := exec.LookPath(s.cfg.ShimBinary)
+	if err != nil {
+		b.Fatalf("shim binary %q not found in PATH: %v", s.cfg.ShimBinary, err)
+	}
+	if shimDir := filepath.Dir(shimBin); !strings.Contains(os.Getenv("PATH"), shimDir) {
+		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	}
+	imgs := buildShimImages(b, s.cfg)
+
 	base := containerID(b)
 	ns := shimtestNamespace
 
@@ -131,7 +167,19 @@ func (s *RunSuite) benchStartup(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		cid := fmt.Sprintf("%s-%d", base, i)
-		shimBin, bundleDir, rootfsMounts := shimSetup(b, s.cfg)
+
+		bundleDir := b.TempDir()
+		bundleDir, err = filepath.EvalSymlinks(bundleDir)
+		if err != nil {
+			b.Fatal("resolve bundle dir:", err)
+		}
+		rootfsDir := filepath.Join(bundleDir, "rootfs")
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			b.Fatal("mkdir rootfs:", err)
+		}
+		b.Cleanup(func() { mount.Unmount(rootfsDir, 0) })
+		rootfsMounts := buildRootfsMountsFromImages(b, s.cfg, imgs, rootfsDir)
+
 		createOCISpec(b, bundleDir, []string{"/bin/forever", "started"}, s.cfg)
 		stdoutPath, stderrPath := createIOFifos(b, bundleDir)
 		ctx := namespaces.WithNamespace(b.Context(), ns)
@@ -182,6 +230,15 @@ func (s *RunSuite) benchStartup(b *testing.B) {
 // benchStartupPhases reports per-phase timings for the startup
 // sequence. Custom metrics are averaged over b.N iterations.
 func (s *RunSuite) benchStartupPhases(b *testing.B) {
+	shimBin, err := exec.LookPath(s.cfg.ShimBinary)
+	if err != nil {
+		b.Fatalf("shim binary %q not found in PATH: %v", s.cfg.ShimBinary, err)
+	}
+	if shimDir := filepath.Dir(shimBin); !strings.Contains(os.Getenv("PATH"), shimDir) {
+		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	}
+	imgs := buildShimImages(b, s.cfg)
+
 	base := containerID(b)
 	ns := shimtestNamespace
 
@@ -191,7 +248,19 @@ func (s *RunSuite) benchStartupPhases(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		cid := fmt.Sprintf("%s-%d", base, i)
-		shimBin, bundleDir, rootfsMounts := shimSetup(b, s.cfg)
+
+		bundleDir := b.TempDir()
+		bundleDir, err = filepath.EvalSymlinks(bundleDir)
+		if err != nil {
+			b.Fatal("resolve bundle dir:", err)
+		}
+		rootfsDir := filepath.Join(bundleDir, "rootfs")
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			b.Fatal("mkdir rootfs:", err)
+		}
+		b.Cleanup(func() { mount.Unmount(rootfsDir, 0) })
+		rootfsMounts := buildRootfsMountsFromImages(b, s.cfg, imgs, rootfsDir)
+
 		createOCISpec(b, bundleDir, []string{"/bin/forever", "started"}, s.cfg)
 		stdoutPath, stderrPath := createIOFifos(b, bundleDir)
 		ctx := namespaces.WithNamespace(b.Context(), ns)
@@ -270,7 +339,25 @@ func (s *RunSuite) benchStartupPhases(b *testing.B) {
 // benchStart measures just the shim "start" subcommand: the time
 // from fork/exec of the shim binary until it returns its bootstrap
 // parameters.
+//
+// The shim daemon is started and immediately shut down. No container
+// task is created within it — the TTRPC Create method is never called
+// — so the shim never receives or mounts rootfsMounts. Because the
+// rootfs images are unused, they are not built at all: each iteration
+// needs only a minimal bundle directory (config.json + log FIFO),
+// which avoids O(b.N) erofs accumulation on the tmpfs at the high
+// iteration counts this fast benchmark produces.
 func (s *RunSuite) benchStart(b *testing.B) {
+	// Resolve the shim binary once; a fresh minimal bundle dir is
+	// created per iteration (tiny: only config.json + log fifo).
+	shimBin, err := exec.LookPath(s.cfg.ShimBinary)
+	if err != nil {
+		b.Fatalf("shim binary %q not found in PATH: %v", s.cfg.ShimBinary, err)
+	}
+	if shimDir := filepath.Dir(shimBin); !strings.Contains(os.Getenv("PATH"), shimDir) {
+		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+	}
+
 	base := containerID(b)
 	ns := shimtestNamespace
 
@@ -278,7 +365,15 @@ func (s *RunSuite) benchStart(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		cid := fmt.Sprintf("%s-%d", base, i)
-		shimBin, bundleDir, _ := shimSetup(b, s.cfg)
+
+		bundleDir := b.TempDir()
+		bundleDir, err = filepath.EvalSymlinks(bundleDir)
+		if err != nil {
+			b.Fatal("resolve bundle dir:", err)
+		}
+		if err := os.MkdirAll(filepath.Join(bundleDir, "rootfs"), 0755); err != nil {
+			b.Fatal("mkdir rootfs:", err)
+		}
 		createOCISpec(b, bundleDir, []string{"/bin/forever"}, s.cfg)
 		ctx := namespaces.WithNamespace(b.Context(), ns)
 

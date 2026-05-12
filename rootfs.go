@@ -498,6 +498,53 @@ func writeLayersErofs(tb testing.TB, n int) []string {
 	return paths
 }
 
+// shimImages holds the pre-built read-only erofs images needed by
+// shimSetup. Benchmarks build these once before their iteration loop
+// (with buildShimImages) and produce per-iteration writable mounts
+// from them (with buildRootfsMountsFromImages), avoiding the O(b.N)
+// accumulation of large erofs files on the tmpfs.
+type shimImages struct {
+	erofsImg string // rootfs.erofs path
+	bigImg   string // bigfile.erofs path
+	lowerDir string // pre-extracted overlay lower dir (root, !FormatMounts only)
+}
+
+// buildShimImages pre-builds the constant read-only rootfs images that
+// buildEmbeddedRootfs would otherwise create on every shimSetup call.
+// Intended for benchmarks: call once before the b.N loop and pass the
+// result to buildRootfsMountsFromImages on each iteration.
+func buildShimImages(tb testing.TB, cfg Config) shimImages {
+	tb.Helper()
+	var imgs shimImages
+	imgs.erofsImg = writeRootfsErofs(tb)
+	imgs.bigImg = writeBigFileErofs(tb)
+	// For root overlay mode, pre-extract the lower directory once so
+	// per-iteration setup only needs to create upper/work.
+	if !cfg.FormatMounts && os.Getuid() == 0 {
+		imgs.lowerDir = extractErofsToDir(tb, imgs.erofsImg)
+		extractErofsIntoDir(tb, imgs.bigImg, imgs.lowerDir)
+	}
+	return imgs
+}
+
+// buildRootfsMountsFromImages is the per-iteration complement of
+// buildShimImages. It creates only the writable parts of the rootfs
+// (ext4 scratch image for FormatMounts, or overlay upper/work
+// directories otherwise) fresh for each benchmark iteration.
+// rootfsDir is the bundle's rootfs directory (used for rootless mode).
+func buildRootfsMountsFromImages(tb testing.TB, cfg Config, imgs shimImages, rootfsDir string) []*types.Mount {
+	tb.Helper()
+	if cfg.FormatMounts {
+		return buildErofsMounts(tb, []string{imgs.erofsImg, imgs.bigImg})
+	}
+	if os.Getuid() != 0 {
+		extractErofsIntoDir(tb, imgs.erofsImg, rootfsDir)
+		extractErofsIntoDir(tb, imgs.bigImg, rootfsDir)
+		return nil
+	}
+	return buildOverlayMounts(tb, imgs.lowerDir)
+}
+
 // buildErofsMounts builds the layered erofs layout: ext4 (rw scratch)
 // + one or more erofs lowers + overlay. Lowers are stacked in order,
 // with erofsImgs[0] highest (matching overlay's lowerdir semantics).
