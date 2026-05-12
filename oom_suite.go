@@ -41,6 +41,7 @@ func NewOOMSuite(cfg Config) *OOMSuite {
 // Run runs every test in the suite as a subtest of t.
 func (s *OOMSuite) Run(t *testing.T) {
 	t.Helper()
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("OOM", s.testOOM)
 }
 
@@ -55,9 +56,10 @@ func (s *OOMSuite) testOOM(t *testing.T) {
 	)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "oom")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()

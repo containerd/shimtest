@@ -32,6 +32,12 @@ func readRSS(pid int) (int64, error) {
 	return 0, errors.New("readRSS is not implemented on " + runtime.GOOS)
 }
 
+// shimCmdlineInfo is unimplemented on non-Linux platforms. Returns an
+// empty string so leak-detection error messages degrade gracefully.
+func shimCmdlineInfo(pid int) string {
+	return ""
+}
+
 // shimPIDs is unimplemented on non-Linux platforms. Returns nil so
 // leak detection silently degrades to a no-op (shimPIDs(nil)+pidDiff
 // reports an empty leak set). macOS would use sysctl KERN_PROC,

@@ -54,6 +54,7 @@ func NewExecSuite(cfg Config) *ExecSuite {
 // Run runs every test in the suite as a subtest of t.
 func (s *ExecSuite) Run(t *testing.T) {
 	t.Helper()
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("Exec", s.testExec)
 	t.Run("StdioRoundTrip", s.testStdioRoundTrip)
 	t.Run("Clock", s.testClock)
@@ -71,9 +72,10 @@ func (s *ExecSuite) testExec(t *testing.T) {
 	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -157,9 +159,10 @@ func (s *ExecSuite) testStdioRoundTrip(t *testing.T) {
 	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -255,9 +258,10 @@ func (s *ExecSuite) testClock(t *testing.T) {
 	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -356,9 +360,10 @@ func (s *ExecSuite) testExitCodes(t *testing.T) {
 	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -473,9 +478,10 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg, opts...)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, cid, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, cid, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()

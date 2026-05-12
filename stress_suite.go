@@ -76,20 +76,7 @@ func (s *StressSuite) Run(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	// Snapshot shim PIDs before the suite runs and verify after all
-	// subtest cleanups have fired (LIFO order — cleanups registered
-	// later run earlier).
-	beforePIDs := shimPIDs(t, s.cfg.ShimBinary)
-	t.Cleanup(func() {
-		// Give kernel a moment to reap zombies after the last
-		// shutdown RPC.
-		time.Sleep(500 * time.Millisecond)
-		afterPIDs := shimPIDs(t, s.cfg.ShimBinary)
-		leaked := pidDiff(beforePIDs, afterPIDs)
-		if len(leaked) > 0 {
-			t.Errorf("leaked %d shim processes: %v", len(leaked), leaked)
-		}
-	})
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 
 	t.Run("Lifecycle", s.testLifecycle)
 	t.Run("Exec", s.testExec)
@@ -129,10 +116,8 @@ func (s *StressSuite) testLifecycle(t *testing.T) {
 	rate := float64(iters) / elapsed.Seconds()
 	t.Logf("lifecycle: %d iterations in %s (%.0f iter/s)",
 		iters, elapsed.Round(time.Millisecond), rate)
-	if n := ttrpcClosedOnShutdown.Load(); n > 0 {
-		t.Logf("lifecycle: %d/%d Shutdown RPCs returned ttrpc: closed (suppressed)",
-			n, iters)
-	}
+	t.Logf("lifecycle: ttrpc: closed on Shutdown: %d/%d",
+		ttrpcClosedOnShutdown.Load(), iters)
 	if err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
@@ -150,9 +135,10 @@ func doFullLifecycle(t *testing.T, baseCtx context.Context, cfg Config, ttrpcClo
 	createOCISpec(t, bundleDir, []string{"/bin/echo", "hello"}, cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(baseCtx, shimtestNamespace)
+	ns := uniqueTestNamespace(t, "stress")
+	ctx := namespaces.WithNamespace(baseCtx, ns)
 
-	params := startShim(t, shimBin, bundleDir, cid, shimtestNamespace, cfg)
+	params := startShim(t, shimBin, bundleDir, cid, ns, cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -225,7 +211,7 @@ const stressGuestMemSampleInterval = 30 * time.Second
 // leak signal than host RSS, which can vary due to VM memory
 // ballooning and VMM overhead.
 func (s *StressSuite) testExec(t *testing.T) {
-	env := newShimEnv(t, t.Context(), s.cfg)
+	env := newShimEnv(t, t.Context(), s.cfg, "stress")
 	defer shutdownShim(t, env.ctx, env)
 
 	pid := env.shimPID
@@ -511,17 +497,6 @@ func readGuestMem(ctx context.Context, env *shimEnv, execID string) (int64, erro
 	return (totalKiB - availKiB) * 1024, nil
 }
 
-// pidDiff returns PIDs in `after` that aren't in `before`.
-func pidDiff(before, after map[int]struct{}) []int {
-	var out []int
-	for pid := range after {
-		if _, ok := before[pid]; !ok {
-			out = append(out, pid)
-		}
-	}
-	return out
-}
-
 // stressIterationTimeout caps how long any single Transfer or exec
 // is allowed to take. A healthy iteration finishes in single-digit
 // milliseconds; anything more than this is a hang.
@@ -567,7 +542,7 @@ type stressSubtest struct {
 // shim env and stops at the first failure. Subtest iteration counts
 // are reported via t.Logf. (Was previously TransferSuite.testStress.)
 func (s *StressSuite) testTransfer(t *testing.T) {
-	env := newShimEnv(t, t.Context(), s.cfg)
+	env := newShimEnv(t, t.Context(), s.cfg, "stress")
 	skipIfNoTransfer(t, env)
 	defer shutdownShim(t, env.ctx, env)
 

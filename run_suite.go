@@ -51,6 +51,7 @@ func NewRunSuite(cfg Config) *RunSuite {
 // Run runs every test in the suite as a subtest of t.
 func (s *RunSuite) Run(t *testing.T) {
 	t.Helper()
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("Lifecycle", s.testLifecycle)
 	t.Run("InitExitCodes", s.testInitExitCodes)
 	t.Run("OutputThenExit", s.testOutputThenExit)
@@ -67,9 +68,10 @@ func (s *RunSuite) testLifecycle(t *testing.T) {
 
 	containerID := containerID(t)
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "run")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	t.Log("shim started, address:", params.Address)
 
 	conn := connectShim(t, params.Address)
@@ -187,9 +189,10 @@ func (s *RunSuite) testInitExitCodes(t *testing.T) {
 			createOCISpec(t, bundleDir, []string{"/bin/exit", strconv.Itoa(code)}, s.cfg)
 
 			stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-			ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+			ns := uniqueTestNamespace(t, "run")
+			ctx := namespaces.WithNamespace(t.Context(), ns)
 
-			params := startShim(t, shimBin, bundleDir, cid, shimtestNamespace, s.cfg)
+			params := startShim(t, shimBin, bundleDir, cid, ns, s.cfg)
 			conn := connectShim(t, params.Address)
 			client := ttrpc.NewClient(conn)
 			defer client.Close()
@@ -230,9 +233,10 @@ func (s *RunSuite) testOutputThenExit(t *testing.T) {
 	createOCISpec(t, bundleDir, []string{"/bin/tickexit"}, s.cfg)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "run")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
@@ -248,7 +252,7 @@ func (s *RunSuite) testOutputThenExit(t *testing.T) {
 		t.Fatal("create failed:", err)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
-		t.Fatal("start failed:", err)
+		t.Fatal("failed to start task:", err)
 	}
 
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
@@ -304,7 +308,7 @@ func (s *RunSuite) testOutputThenExit(t *testing.T) {
 func (s *RunSuite) testEvents(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	containerID := containerID(t)
-	ns := shimtestNamespace
+	ns := uniqueTestNamespace(t, "run")
 
 	createOCISpec(t, bundleDir, []string{"/bin/exit", "0"}, s.cfg)
 

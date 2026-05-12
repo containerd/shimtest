@@ -49,6 +49,33 @@ func readRSS(pid int) (int64, error) {
 	return 0, fmt.Errorf("VmRSS not found in /proc/%d/status", pid)
 }
 
+// shimCmdlineInfo reads /proc/<pid>/cmdline and extracts the values of
+// the -namespace and -id flags passed to the shim binary. The returned
+// string is suitable for embedding in leak-detection error messages,
+// e.g. "namespace=shimtest-a1b2c3d4 id=testshim-lifecycle-iter00042-89ab".
+// Returns an empty string if the file cannot be read or the flags are absent.
+func shimCmdlineInfo(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	// /proc/<pid>/cmdline stores argv entries separated by NUL bytes.
+	args := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+	var ns, id string
+	for i := 0; i < len(args)-1; i++ {
+		switch args[i] {
+		case "-namespace":
+			ns = args[i+1]
+		case "-id":
+			id = args[i+1]
+		}
+	}
+	if ns == "" && id == "" {
+		return ""
+	}
+	return fmt.Sprintf("namespace=%s id=%s", ns, id)
+}
+
 // shimPIDs returns the set of currently-live shim processes whose
 // /proc/<pid>/exe symlink resolves to the same path as binary.
 // Returns nil on errors so leak detection silently degrades to a

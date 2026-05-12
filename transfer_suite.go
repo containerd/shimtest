@@ -56,6 +56,7 @@ func NewTransferSuite(cfg Config) *TransferSuite {
 // true} to run it.
 func (s *TransferSuite) Run(t *testing.T) {
 	t.Helper()
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("TransferCopyTo", s.testCopyTo)
 	t.Run("TransferCopyToAndFrom", s.testCopyToAndFrom)
 	t.Run("TransferExecVerify", s.testExecVerify)
@@ -64,7 +65,7 @@ func (s *TransferSuite) Run(t *testing.T) {
 // TestCopyTo copies a small file into a running container via the
 // transfer service.
 func (s *TransferSuite) testCopyTo(t *testing.T) {
-	env := newShimEnv(t, t.Context(), s.cfg)
+	env := newShimEnv(t, t.Context(), s.cfg, "transfer")
 	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
@@ -77,7 +78,7 @@ func (s *TransferSuite) testCopyTo(t *testing.T) {
 // TestCopyToAndFrom copies a file in then back out and verifies the
 // content matches.
 func (s *TransferSuite) testCopyToAndFrom(t *testing.T) {
-	env := newShimEnv(t, t.Context(), s.cfg)
+	env := newShimEnv(t, t.Context(), s.cfg, "transfer")
 	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
@@ -95,7 +96,7 @@ func (s *TransferSuite) testCopyToAndFrom(t *testing.T) {
 
 // TestExecVerify copies a file in and verifies it via /bin/cat exec.
 func (s *TransferSuite) testExecVerify(t *testing.T) {
-	env := newShimEnv(t, t.Context(), s.cfg)
+	env := newShimEnv(t, t.Context(), s.cfg, "transfer")
 	skipIfNoTransfer(t, env)
 	const testContent = "transfer-test-data-12345\n"
 
@@ -283,7 +284,7 @@ func shimExec(t *testing.T, ctx context.Context, env *shimEnv, execID string, ar
 // directory and asserts the transfer service returns an
 // application-level error (not a timeout).
 func (s *TransferSuite) Fuzz(f *testing.F) {
-	env := newShimEnv(f, f.Context(), s.cfg)
+	env := newShimEnv(f, f.Context(), s.cfg, "transfer")
 	skipIfNoTransfer(f, env)
 
 	f.Add("missing.txt")

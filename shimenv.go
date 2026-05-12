@@ -55,7 +55,12 @@ type shimEnv struct {
 // init process. Tests that need a different command build their own
 // env via the lower-level helpers (shimSetup, createOCISpec,
 // startShim, ...).
-func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
+//
+// suite is the short name of the calling suite (e.g. "stress",
+// "transfer") and is forwarded to uniqueTestNamespace so that the
+// containerd namespace used by this shim encodes the suite for
+// zombie-process attribution.
+func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config, suite string) *shimEnv {
 	tb.Helper()
 
 	shimBin, bundleDir, rootfsMounts := shimSetup(tb, cfg)
@@ -66,13 +71,14 @@ func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config) *shimEnv {
 
 	stdoutPath, stderrPath := createIOFifos(tb, bundleDir)
 
-	ctx := namespaces.WithNamespace(baseCtx, shimtestNamespace)
+	ns := uniqueTestNamespace(tb, suite)
+	ctx := namespaces.WithNamespace(baseCtx, ns)
 
 	// Bind a no-op events listener so the shim's outgoing event
 	// publishes succeed instead of timing out for 5s each.
 	startEventsRecorder(tb, bundleDir)
 
-	params := startShim(tb, shimBin, bundleDir, cid, shimtestNamespace, cfg)
+	params := startShim(tb, shimBin, bundleDir, cid, ns, cfg)
 
 	conn := connectShim(tb, params.Address)
 	client := ttrpc.NewClient(conn)

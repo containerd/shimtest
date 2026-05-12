@@ -48,6 +48,7 @@ func NewUDSSuite(cfg Config) *UDSSuite {
 // name is kept as UDSRoundTrip to match historical -test.run filters.
 func (s *UDSSuite) Run(t *testing.T) {
 	t.Helper()
+	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("UDSRoundTrip", s.testRoundTrip)
 }
 
@@ -81,9 +82,10 @@ func (s *UDSSuite) testRoundTrip(t *testing.T) {
 	)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
-	ctx := namespaces.WithNamespace(t.Context(), shimtestNamespace)
+	ns := uniqueTestNamespace(t, "uds")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
 
-	params := startShim(t, shimBin, bundleDir, containerID, shimtestNamespace, s.cfg)
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
