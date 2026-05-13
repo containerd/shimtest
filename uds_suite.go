@@ -59,7 +59,7 @@ func (s *UDSSuite) testRoundTrip(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	containerID := containerID(t)
 
-	hostSockDir, err := os.MkdirTemp("/tmp", "nb-uds-")
+	hostSockDir, err := os.MkdirTemp("", "nb-uds-")
 	if err != nil {
 		t.Fatal("create uds dir:", err)
 	}

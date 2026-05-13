@@ -286,6 +286,7 @@ func shimExec(t *testing.T, ctx context.Context, env *shimEnv, execID string, ar
 func (s *TransferSuite) Fuzz(f *testing.F) {
 	env := newShimEnv(f, f.Context(), s.cfg, "transfer")
 	skipIfNoTransfer(f, env)
+	defer shutdownShim(f, env.ctx, env)
 
 	f.Add("missing.txt")
 	f.Add("a/b/c/d.txt")
