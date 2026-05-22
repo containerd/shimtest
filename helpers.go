@@ -445,6 +445,9 @@ func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) boo
 		"SHIM_SOCKET_DIR="+socketDir,
 		"TTRPC_ADDRESS="+containerdAddr,
 	)
+	for k, v := range cfg.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
