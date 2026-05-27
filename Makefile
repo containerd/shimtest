@@ -6,7 +6,7 @@ TEST_BINARY = _output/shimtest.exe
 else
 TEST_BINARY = _output/shimtest.test
 endif
-TESTBIN_OUT = _output/testbin
+TESTBIN_OUT = testdata/testbin
 
 # Target arch for testbin. Always linux; defaults to amd64.
 TESTBIN_GOARCH ?= amd64
@@ -14,12 +14,10 @@ TESTBIN_GOARCH ?= amd64
 .PHONY: build testbin clean help
 
 build: testbin
-	$(GO) test -c -tags "shimtest_embedded$(if $(GO_BUILDTAGS), $(GO_BUILDTAGS),)" -o $(TEST_BINARY) .
+	$(GO) test -c $(if $(GO_BUILDTAGS),-tags "$(strip $(GO_BUILDTAGS))",) -o $(TEST_BINARY) .
 
-testbin: $(TESTBIN_OUT)
-
-$(TESTBIN_OUT):
-	@mkdir -p _output
+testbin:
+	@mkdir -p testdata
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(TESTBIN_GOARCH) \
 		$(GO) build -ldflags='-s -w' -o $(TESTBIN_OUT) ./cmd/testbin
 
@@ -36,9 +34,6 @@ help:
 	@echo ""
 	@echo "Cross-compilation (always linux):"
 	@echo "  make testbin TESTBIN_GOARCH=arm64"
-	@echo ""
-	@echo "If a pre-built testbin is available, place it at"
-	@echo "$(TESTBIN_OUT) before running make build."
 	@echo ""
 	@echo "Running tests:"
 	@echo "  $(TEST_BINARY) -test.v -test.timeout=120s -shimtest.config=<config.json>"

@@ -17,14 +17,18 @@
 package shimtest
 
 import (
+	"bytes"
 	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -32,6 +36,140 @@ import (
 	"github.com/containerd/continuity/pkg/ext4"
 	erofs "github.com/erofs/go-erofs"
 )
+
+const shimtestModulePath = "github.com/dmcgowan/shimtest"
+
+// testbinOS is the OS for which testbin is always built. Regardless of the
+// host running the tests, the container binary is always a Linux ELF.
+const testbinOS = "linux"
+
+// testbinLocalPath is the path checked first for a locally built testbin,
+// relative to the module source root. It lives under testdata/ so that
+// go mod vendor never copies it into downstream vendor trees.
+//
+//go:generate make testbin
+const testbinLocalPath = "testdata/testbin"
+
+// openTestbin returns a reader for the testbin binary. It checks
+// testdata/testbin first (populated by "make testbin" or "go generate"),
+// then falls back to downloading the binary for the current GOARCH from the
+// GitHub release that matches the resolved version of this module. The
+// downloaded binary is cached under os.UserCacheDir()/shimtest/<version>/.
+//
+// Set SHIMTEST_TESTBIN to the path of a pre-built binary to skip both.
+func openTestbin() (io.Reader, error) {
+	// Explicit override.
+	if path := os.Getenv("SHIMTEST_TESTBIN"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("SHIMTEST_TESTBIN: %w", err)
+		}
+		return bytes.NewReader(data), nil
+	}
+
+	// Local build: testdata/testbin (populated by make testbin / go generate).
+	if data, err := os.ReadFile(testbinLocalPath); err == nil && len(data) > 0 {
+		return bytes.NewReader(data), nil
+	}
+
+	// Fall back to fetching from GitHub Releases.
+	version, err := shimtestVersion()
+	if err != nil {
+		return nil, err
+	}
+	data, err := fetchTestbin(version, runtime.GOARCH)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(data), nil
+}
+
+// shimtestVersion returns the module version of github.com/dmcgowan/shimtest
+// as recorded in the consumer binary's build info. Returns an error if the
+// binary was not built from a tagged release (e.g. a replace directive or
+// local development checkout).
+func shimtestVersion() (string, error) {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", fmt.Errorf(
+			"shimtest: cannot read build info; run 'make testbin' or 'go generate' " +
+				"to build testdata/testbin, or set SHIMTEST_TESTBIN to a pre-built binary",
+		)
+	}
+
+	// When shimtest is the main module (e.g. running its own tests via
+	// `go test` without a local testbin), bi.Main holds it.
+	if bi.Main.Path == shimtestModulePath {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v, nil
+		}
+		return "", unversionedError()
+	}
+
+	// When shimtest is a dependency, look it up in the dep list.
+	for _, dep := range bi.Deps {
+		if dep.Path == shimtestModulePath {
+			if dep.Version == "" || dep.Version == "(devel)" {
+				return "", unversionedError()
+			}
+			return dep.Version, nil
+		}
+	}
+
+	return "", unversionedError()
+}
+
+func unversionedError() error {
+	return fmt.Errorf(
+		"shimtest: module version is not a tagged release " +
+			"(local replace directive or development build); " +
+			"run 'make testbin' or 'go generate' to build testdata/testbin, " +
+			"or set SHIMTEST_TESTBIN to the path of a pre-built binary",
+	)
+}
+
+// fetchTestbin downloads the testbin Linux binary for the given version/goarch
+// from the GitHub release, caching it at testdata/testbin for subsequent runs.
+func fetchTestbin(version, goarch string) ([]byte, error) {
+	url := testbinURL(version, goarch)
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		return nil, fmt.Errorf("shimtest: fetching testbin from %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"shimtest: fetching testbin from %s: unexpected status %s; "+
+				"ensure a release exists for version %s, run 'make testbin', or set SHIMTEST_TESTBIN",
+			url, resp.Status, version,
+		)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("shimtest: reading testbin from %s: %w", url, err)
+	}
+
+	// Cache at testdata/testbin so subsequent runs skip the download.
+	if err := os.MkdirAll("testdata", 0755); err == nil {
+		_ = os.WriteFile(testbinLocalPath, data, 0755)
+	}
+	return data, nil
+}
+
+func testbinURL(version, goarch string) string {
+	return fmt.Sprintf(
+		"https://github.com/%s/releases/download/%s/%s",
+		strings.TrimPrefix(shimtestModulePath, "github.com/"),
+		version,
+		testbinAssetName(goarch),
+	)
+}
+
+func testbinAssetName(goarch string) string {
+	return fmt.Sprintf("testbin-%s-%s", testbinOS, goarch)
+}
 
 // testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command in the embedded
