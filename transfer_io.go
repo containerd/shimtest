@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"sync"
 
 	streamingapi "github.com/containerd/containerd/api/services/streaming/v1"
 	"github.com/containerd/containerd/v2/core/streaming"
@@ -53,30 +52,6 @@ func marshalTransferAny(ctx context.Context, v any, sc streaming.StreamCreator) 
 		TypeUrl: a.GetTypeUrl(),
 		Value:   a.GetValue(),
 	}, nil
-}
-
-// nopWriteCloser wraps an io.Writer with a no-op Close.
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nopWriteCloser) Close() error { return nil }
-
-// signalCloser wraps an io.Writer with a Close that closes a done
-// channel. WriteStream's MarshalAny goroutine calls Close() after
-// draining the stream into the underlying writer; consumers can
-// block on done to know when the buffer is fully populated.
-type signalCloser struct {
-	w    io.Writer
-	done chan struct{}
-	once sync.Once
-}
-
-func (s *signalCloser) Write(p []byte) (int, error) { return s.w.Write(p) }
-
-func (s *signalCloser) Close() error {
-	s.once.Do(func() { close(s.done) })
-	return nil
 }
 
 // ttrpcStreamCreator implements streaming.StreamCreator over TTRPC.

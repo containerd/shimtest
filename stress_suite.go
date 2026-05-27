@@ -780,7 +780,8 @@ func stressCtx(t *testing.T, parent context.Context) (context.Context, context.C
 }
 
 // stressTransferStat performs a single Transfer with NoWalk=true on
-// the given path. The server-side payload is discarded.
+// the given path. The server-side payload is discarded; only the RPC
+// status (success or error) matters.
 func stressTransferStat(ctx context.Context, env *shimEnv, path string) error {
 	subCtx, cancel := context.WithTimeout(ctx, stressIterationTimeout)
 	defer cancel()
@@ -790,9 +791,13 @@ func stressTransferStat(ctx context.Context, env *shimEnv, path string) error {
 		Path:        path,
 		NoWalk:      true,
 	}
-	dst := transfer.NewWriteStream(&nopWriteCloser{io.Discard}, "application/x-tar")
+	dst := transfer.NewWriteStream(io.Discard, "application/x-tar")
 
-	return stressDoTransfer(subCtx, env, src, dst)
+	if err := stressDoTransfer(subCtx, env, src, dst); err != nil {
+		return err
+	}
+	// Drain the receive goroutine so it doesn't outlive the caller.
+	return dst.Wait(subCtx)
 }
 
 // stressTransferWriteFile writes a single small file as a one-entry
@@ -822,7 +827,12 @@ func stressTransferWriteFile(ctx context.Context, env *shimEnv, dir, name, conte
 		ContainerID: env.containerID,
 		Path:        dir,
 	}
-	return stressDoTransfer(subCtx, env, src, dst)
+	if err := stressDoTransfer(subCtx, env, src, dst); err != nil {
+		return err
+	}
+	// Wait for the background send goroutine to finish and surface any
+	// transport error it encountered.
+	return src.Wait(subCtx)
 }
 
 // stressTransferReadFile reads a single file back from the container
@@ -837,22 +847,16 @@ func stressTransferReadFile(ctx context.Context, env *shimEnv, path, name string
 	}
 
 	var received bytes.Buffer
-	closed := make(chan struct{})
-	dst := transfer.NewWriteStream(&signalCloser{w: &received, done: closed}, "application/x-tar")
+	dst := transfer.NewWriteStream(&received, "application/x-tar")
 
 	if err := stressDoTransfer(subCtx, env, src, dst); err != nil {
 		return "", err
 	}
 
-	// Wait for the WriteStream's MarshalAny goroutine to finish
-	// draining the stream into received. The Transfer RPC returning
-	// only confirms the server is done writing — the client-side
-	// io.Copy from stream into received runs in a separate goroutine
-	// that signals via the writer's Close.
-	select {
-	case <-closed:
-	case <-subCtx.Done():
-		return "", subCtx.Err()
+	// Wait for the background receive goroutine to finish draining the
+	// stream into received, and surface any transport error it encountered.
+	if err := dst.Wait(subCtx); err != nil {
+		return "", fmt.Errorf("receive stream: %w", err)
 	}
 
 	tr := tar.NewReader(&received)

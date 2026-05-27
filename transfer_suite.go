@@ -154,6 +154,11 @@ func copyToContainer(t *testing.T, ctx context.Context, env *shimEnv, content, p
 	}); err != nil {
 		t.Fatal("copy-to transfer failed:", err)
 	}
+	// Wait for the background send goroutine to finish draining the
+	// reader and surface any transport error it encountered.
+	if err := src.Wait(ctx); err != nil {
+		t.Fatal("copy-to stream error:", err)
+	}
 }
 
 // copyFromContainer reads a file from the container via the transfer
@@ -167,7 +172,7 @@ func copyFromContainer(t *testing.T, ctx context.Context, env *shimEnv, path str
 	}
 
 	var received bytes.Buffer
-	dst := transfer.NewWriteStream(&nopWriteCloser{&received}, "application/x-tar")
+	dst := transfer.NewWriteStream(&received, "application/x-tar")
 
 	srcAny, err := marshalTransferAny(ctx, src, env.sc)
 	if err != nil {
@@ -184,6 +189,14 @@ func copyFromContainer(t *testing.T, ctx context.Context, env *shimEnv, path str
 		Destination: dstAny,
 	}); err != nil {
 		t.Fatal("copy-from transfer failed:", err)
+	}
+	// Wait for the background receive goroutine to finish draining the
+	// stream into received. The Transfer RPC returning only confirms the
+	// server is done writing; the client-side io.Copy runs in a separate
+	// goroutine. Waiting here also surfaces any transport error rather
+	// than silently delivering an empty or truncated result.
+	if err := dst.Wait(ctx); err != nil {
+		t.Fatal("copy-from stream error:", err)
 	}
 
 	tr := tar.NewReader(&received)
