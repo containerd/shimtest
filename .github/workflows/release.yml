@@ -29,13 +29,13 @@ jobs:
         run: make testbin TESTBIN_GOARCH=${{ matrix.goarch }}
 
       - name: Rename asset
-        run: mv _output/testbin _output/testbin-linux-${{ matrix.goarch }}
+        run: mv testdata/testbin testdata/testbin-linux-${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: testbin-linux-${{ matrix.goarch }}
-          path: _output/testbin-linux-${{ matrix.goarch }}
+          path: testdata/testbin-linux-${{ matrix.goarch }}
           if-no-files-found: error
 
   release:
