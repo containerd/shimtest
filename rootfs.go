@@ -28,7 +28,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -53,8 +52,8 @@ const testbinLocalPath = "testdata/testbin"
 // openTestbin returns a reader for the testbin binary. It checks
 // testdata/testbin first (populated by "make testbin" or "go generate"),
 // then falls back to downloading the binary for the current GOARCH from the
-// GitHub release that matches the resolved version of this module. The
-// downloaded binary is cached under os.UserCacheDir()/shimtest/<version>/.
+// GitHub release for testbinVersion. The downloaded binary is cached at
+// testdata/testbin for subsequent runs.
 //
 // Set SHIMTEST_TESTBIN to the path of a pre-built binary to skip both.
 func openTestbin() (io.Reader, error) {
@@ -72,60 +71,12 @@ func openTestbin() (io.Reader, error) {
 		return bytes.NewReader(data), nil
 	}
 
-	// Fall back to fetching from GitHub Releases.
-	version, err := shimtestVersion()
-	if err != nil {
-		return nil, err
-	}
-	data, err := fetchTestbin(version, runtime.GOARCH)
+	// Fetch from the GitHub release for the current testbinVersion.
+	data, err := fetchTestbin(testbinVersion, runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
 	return bytes.NewReader(data), nil
-}
-
-// shimtestVersion returns the module version of github.com/dmcgowan/shimtest
-// as recorded in the consumer binary's build info. Returns an error if the
-// binary was not built from a tagged release (e.g. a replace directive or
-// local development checkout).
-func shimtestVersion() (string, error) {
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "", fmt.Errorf(
-			"shimtest: cannot read build info; run 'make testbin' or 'go generate' " +
-				"to build testdata/testbin, or set SHIMTEST_TESTBIN to a pre-built binary",
-		)
-	}
-
-	// When shimtest is the main module (e.g. running its own tests via
-	// `go test` without a local testbin), bi.Main holds it.
-	if bi.Main.Path == shimtestModulePath {
-		if v := bi.Main.Version; v != "" && v != "(devel)" {
-			return v, nil
-		}
-		return "", unversionedError()
-	}
-
-	// When shimtest is a dependency, look it up in the dep list.
-	for _, dep := range bi.Deps {
-		if dep.Path == shimtestModulePath {
-			if dep.Version == "" || dep.Version == "(devel)" {
-				return "", unversionedError()
-			}
-			return dep.Version, nil
-		}
-	}
-
-	return "", unversionedError()
-}
-
-func unversionedError() error {
-	return fmt.Errorf(
-		"shimtest: module version is not a tagged release " +
-			"(local replace directive or development build); " +
-			"run 'make testbin' or 'go generate' to build testdata/testbin, " +
-			"or set SHIMTEST_TESTBIN to the path of a pre-built binary",
-	)
 }
 
 // fetchTestbin downloads the testbin Linux binary for the given version/goarch

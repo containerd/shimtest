@@ -1,0 +1,26 @@
+#!/bin/sh
+# Pre-push hook: when pushing a tag, verify that the Version const in
+# version.go matches the tag being pushed.
+#
+# Install: git config core.hooksPath .githooks
+
+while read local_ref local_sha remote_ref remote_sha; do
+    # Only check tag refs (refs/tags/...).
+    case "$remote_ref" in
+        refs/tags/*)
+            tag="${remote_ref#refs/tags/}"
+            version=$(grep -E '^const testbinVersion\s*=' version.go | grep -oE '"[^"]+"' | tr -d '"')
+            if [ -z "$version" ]; then
+                echo "pre-push: could not read testbinVersion from version.go" >&2
+                exit 1
+            fi
+            if [ "$version" != "$tag" ]; then
+                echo "pre-push: version.go has testbinVersion=\"$version\" but tag is \"$tag\"" >&2
+                echo "pre-push: update version.go before pushing this tag" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+exit 0
