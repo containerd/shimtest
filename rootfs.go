@@ -17,9 +17,6 @@
 package shimtest
 
 import (
-	"bytes"
-	"compress/gzip"
-	_ "embed"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -35,14 +32,6 @@ import (
 	"github.com/containerd/continuity/pkg/ext4"
 	erofs "github.com/erofs/go-erofs"
 )
-
-//go:embed _output/testbin.gz
-var testbinGz []byte
-
-// openTestbin returns a reader for the decompressed testbin binary.
-func openTestbin() (io.Reader, error) {
-	return gzip.NewReader(bytes.NewReader(testbinGz))
-}
 
 // testbinCommands lists the commands provided by the testbin binary.
 // Symlinks are created in /bin for each command in the embedded

@@ -1,34 +1,30 @@
 GO ?= go
 GO_BUILDTAGS ?=
-GO_TAGS = $(if $(GO_BUILDTAGS),-tags "$(strip $(GO_BUILDTAGS))",)
 # On Windows the test binary must have the .exe extension to be executable.
 ifeq ($(OS),Windows_NT)
 TEST_BINARY = _output/shimtest.exe
 else
 TEST_BINARY = _output/shimtest.test
 endif
-TESTBIN_OUT = _output/testbin.gz
+TESTBIN_OUT = _output/testbin
 
-# Target OS/arch for testbin. Defaults to linux/amd64.
-TESTBIN_GOOS ?= linux
+# Target arch for testbin. Always linux; defaults to amd64.
 TESTBIN_GOARCH ?= amd64
 
 .PHONY: build testbin clean help
 
 build: testbin
-	$(GO) test -c $(GO_TAGS) -o $(TEST_BINARY) .
+	$(GO) test -c -tags "shimtest_embedded$(if $(GO_BUILDTAGS), $(GO_BUILDTAGS),)" -o $(TEST_BINARY) .
 
 testbin: $(TESTBIN_OUT)
 
 $(TESTBIN_OUT):
 	@mkdir -p _output
-	CGO_ENABLED=0 GOOS=$(TESTBIN_GOOS) GOARCH=$(TESTBIN_GOARCH) \
-		$(GO) build -ldflags='-s -w' -o _output/testbin ./cmd/testbin
-	gzip -c -9 _output/testbin > $(TESTBIN_OUT)
-	rm -f _output/testbin
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(TESTBIN_GOARCH) \
+		$(GO) build -ldflags='-s -w' -o $(TESTBIN_OUT) ./cmd/testbin
 
 clean:
-	rm -f $(TEST_BINARY) $(TESTBIN_OUT)
+	rm -f $(TEST_BINARY) $(TESTBIN_OUT) _output/testbin-*
 
 help:
 	@echo "Usage: make build"
@@ -38,10 +34,10 @@ help:
 	@echo "  testbin  Build the testbin container binary only"
 	@echo "  clean    Remove build artifacts"
 	@echo ""
-	@echo "Cross-compilation:"
+	@echo "Cross-compilation (always linux):"
 	@echo "  make testbin TESTBIN_GOARCH=arm64"
 	@echo ""
-	@echo "If a pre-built testbin.gz is available, place it at"
+	@echo "If a pre-built testbin is available, place it at"
 	@echo "$(TESTBIN_OUT) before running make build."
 	@echo ""
 	@echo "Running tests:"
