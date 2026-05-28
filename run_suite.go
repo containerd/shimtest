@@ -19,6 +19,7 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,7 @@ func (s *RunSuite) Run(t *testing.T) {
 	t.Run("InitExitCodes", s.testInitExitCodes)
 	t.Run("OutputThenExit", s.testOutputThenExit)
 	t.Run("Events", s.testEvents)
+	t.Run("ParallelLifecycleScaling", s.testParallelLifecycleScaling)
 }
 
 // testLifecycle drives a container through create / start / state /
@@ -365,4 +367,176 @@ func (s *RunSuite) testEvents(t *testing.T) {
 	if exitEvt.ExitStatus != 0 {
 		t.Errorf("exit event exit status: got %d, want 0", exitEvt.ExitStatus)
 	}
+}
+
+// parallelLifecycleScalingLevel describes one concurrency level for
+// testParallelLifecycleScaling.
+type parallelLifecycleScalingLevel struct {
+	multiplier int    // concurrency = NumCPU * multiplier
+	label      string // subtest name
+	maxRatio   float64 // maximum allowed ratio vs the n baseline
+}
+
+// parallelLifecycleScalingLevels defines the four concurrency levels
+// and their individual ratio limits. The baseline is n (multiplier=1,
+// ratio limit=1.25×). Each subsequent level adds one more n, and its
+// limit grows by 1.25× accordingly: 2n≤2.5×, 3n≤3.75×, 4n≤5.0×.
+//
+// These limits are deliberately tighter than pure linear scaling
+// (which would predict 1×, 2×, 3×, 4×) but looser than exponential
+// growth. A shim that serialises internally — where doubling containers
+// doubles wall time — would breach 1.25× at 2n and fail the test.
+var parallelLifecycleScalingLevels = []parallelLifecycleScalingLevel{
+	{1, "n", 1.25},
+	{2, "2n", 2.50},
+	{3, "3n", 3.75},
+	{4, "4n", 5.00},
+}
+
+// testParallelLifecycleScaling runs the full container lifecycle
+// (shimSetup → startShim → Create → Start → wait for output → kill →
+// wait → delete → shutdown) at four concurrency levels derived from
+// runtime.NumCPU(): n, 2n, 3n, and 4n.
+//
+// At each level all containers are launched simultaneously in their
+// own t.Run subtests so every tb-safe helper (shimSetup, startShim,
+// createIOFifos, …) is called from the subtest's goroutine. A
+// sync.WaitGroup captures wall-clock time from first goroutine launch
+// to last subtest completion.
+//
+// The baseline is the n run. Each higher level is checked against its
+// own limit (1.25×n, 2.50×n, 3.75×n, 5.00×n). This allows up to 25%
+// overhead per additional n of concurrency — enough headroom for
+// scheduler jitter — while catching exponential degradation caused by
+// contention, serialisation, or resource exhaustion.
+func (s *RunSuite) testParallelLifecycleScaling(t *testing.T) {
+	ncpu := runtime.NumCPU()
+	t.Logf("NumCPU = %d", ncpu)
+
+	// elapsed[i] is the wall-clock duration of the i-th level.
+	elapsed := make([]time.Duration, len(parallelLifecycleScalingLevels))
+
+	for idx, lvl := range parallelLifecycleScalingLevels {
+		count := ncpu * lvl.multiplier
+		idx, lvl, count := idx, lvl, count // capture for subtest
+
+		t.Run(lvl.label, func(t *testing.T) {
+			t.Logf("concurrency = %d containers", count)
+
+			var wg sync.WaitGroup
+			// started is closed once all goroutines are in flight,
+			// acting as a release gate so containers begin as
+			// simultaneously as possible.
+			started := make(chan struct{})
+
+			tBegin := time.Now()
+			for j := 0; j < count; j++ {
+				j := j
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-started
+					t.Run(fmt.Sprintf("container%03d", j), func(t *testing.T) {
+						runOneParallelLifecycle(t, s.cfg)
+					})
+				}()
+			}
+			close(started)
+			wg.Wait()
+			elapsed[idx] = time.Since(tBegin)
+
+			if t.Failed() {
+				return
+			}
+			t.Logf("wall time for %d containers: %s", count, elapsed[idx].Round(time.Millisecond))
+		})
+
+		if t.Failed() {
+			return
+		}
+	}
+
+	// baseline is the n run (index 0).
+	baseline := elapsed[0]
+	if baseline == 0 {
+		return
+	}
+
+	// Check each level against its individual ratio limit.
+	t.Log("scaling summary (wall time relative to n baseline):")
+	for idx, lvl := range parallelLifecycleScalingLevels {
+		if elapsed[idx] == 0 {
+			continue
+		}
+		count := ncpu * lvl.multiplier
+		ratio := elapsed[idx].Seconds() / baseline.Seconds()
+		t.Logf("  %-4s  containers=%3d  elapsed=%-10s  ratio=%.2f×  limit=%.2f×",
+			lvl.label, count, elapsed[idx].Round(time.Millisecond), ratio, lvl.maxRatio)
+		if ratio > lvl.maxRatio {
+			t.Errorf("concurrency %s: elapsed %s is %.2f× the n baseline (%s), exceeds %.2f× limit — scaling is not sub-linear",
+				lvl.label, elapsed[idx].Round(time.Millisecond), ratio,
+				baseline.Round(time.Millisecond), lvl.maxRatio)
+		}
+	}
+}
+
+// runOneParallelLifecycle drives a single container through the
+// complete startup lifecycle: shimSetup → OCI spec → startShim →
+// connect → Create → Start → wait for output → kill → wait →
+// delete → shutdown. All tb methods are called on t, making this
+// safe to invoke from a t.Run goroutine.
+func runOneParallelLifecycle(t *testing.T, cfg Config) {
+	t.Helper()
+
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, cfg)
+	cid := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever", "hello"}, cfg)
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "run")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, cid, ns, cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	var stdoutBuf bytes.Buffer
+	var stdoutMu sync.Mutex
+	drainFifoInto(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	deadline := time.After(30 * time.Second)
+	for {
+		stdoutMu.Lock()
+		got := stdoutBuf.String()
+		stdoutMu.Unlock()
+		if strings.Contains(got, "hello") {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for output")
+		case <-time.After(1 * time.Millisecond):
+		}
+	}
+
+	if _, err := tc.Kill(ctx, &taskAPI.KillRequest{ID: cid, Signal: uint32(syscall.SIGKILL), All: true}); err != nil {
+		t.Fatal("kill failed:", err)
+	}
+	if _, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid}); err != nil {
+		t.Fatal("wait failed:", err)
+	}
+	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid}); err != nil {
+		t.Fatal("delete failed:", err)
+	}
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
 }
