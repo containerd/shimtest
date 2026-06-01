@@ -96,7 +96,9 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `ExitCodes` | exec | Exec processes that exit with a range of status codes and verify propagation |
 | `InitExitCodes` | — | Run the container's init process with `/bin/exit N` and verify task-level exit status propagation |
 | `OutputThenExit` | — | Run a process that prints 50 lines over 50ms then exits non-zero; verify both exit status and every line of output |
+| `FastExitInit` | — | Run the container's init as `/bin/burstexit 8MiB 0`; call Delete immediately after Wait (no drain pause); verify full byte count and CRC-32. Regression test for the close-before-drain race in `io.go` (init path) |
 | `Events` | — | Bind a TTRPC events recorder at `TTRPC_ADDRESS` and verify the shim publishes `create`, `start`, `exit`, `delete` events with correct fields |
+| `FastExitOutput` | exec | Exec `/bin/burstexit 8MiB 0` and call Delete immediately after Wait; verify full byte count and CRC-32. Regression test for the close-before-drain race in `io.go` (exec path) |
 | `LargeFileRead` | exec | Read a 64 MiB fixture from a secondary read-only erofs layer, verify crc32-Castagnoli, report MiB/s |
 | `BindMountRead` | exec | Bind-mount the same 64 MiB fixture from a host tempfile and verify+benchmark via the bind path |
 | `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |

@@ -19,6 +19,7 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -60,6 +61,7 @@ func (s *ExecSuite) Run(t *testing.T) {
 	t.Run("ExitCodes", s.testExitCodes)
 	t.Run("LargeFileRead", s.testLargeFileRead)
 	t.Run("BindMountRead", s.testBindMountRead)
+	t.Run("FastExitOutput", s.testFastExitOutput)
 }
 
 // TestExec runs `echo execworks` inside a container and verifies the
@@ -555,4 +557,156 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 	tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
 	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid})
+}
+
+
+// burstPayloadSize is the number of bytes written by /bin/burstexit in
+// the FastExitOutput and FastExitInit tests. It must be large enough
+// that the kernel socket buffers cannot absorb the entire stream
+// before the process exits, ensuring that the shim's host-side copy
+// goroutine is still mid-read from the vsock when ioShutdown closes
+// the connection.
+//
+// 8 MiB comfortably exceeds the default Linux socket receive buffer
+// (rmem_default ≈ 208 KiB) and the 4 KiB bufPool chunk used by
+// io.CopyBuffer.
+const burstPayloadSize = 8 * 1024 * 1024
+
+// burstExpectedCRC32 returns the Castagnoli CRC-32 of the deterministic
+// byte stream produced by /bin/burstexit: a repeating 0x00..0xff tile
+// of exactly burstPayloadSize bytes.
+func burstExpectedCRC32() uint32 {
+	tile := make([]byte, 256)
+	for i := range tile {
+		tile[i] = byte(i)
+	}
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	remaining := burstPayloadSize
+	for remaining > 0 {
+		n := remaining
+		if n > len(tile) {
+			n = len(tile)
+		}
+		h.Write(tile[:n])
+		remaining -= n
+	}
+	return h.Sum32()
+}
+
+// testFastExitOutput execs /bin/burstexit (writes 8 MiB then exits)
+// inside a long-running container, then immediately shuts down the
+// shim without waiting for the exec to finish or calling Delete.
+//
+// The race: the exec process writes 8 MiB quickly. The in-VM stdio
+// copy goroutine drains the process's stdout pipe into the vsock
+// stream. The host copy goroutine reads from the vsock into the FIFO.
+// When Shutdown runs, service.shutdown → c.shutdown → ioShutdown
+// closes the vsock connection. If the host goroutine is still
+// mid-Read at that moment, it sees "use of closed network connection"
+// and returns early, dropping whatever bytes were still buffered in
+// the kernel socket receive queue.
+//
+// A correct shim waits for ioDone (all copy goroutines finished
+// draining) before closing the connections.
+func (s *ExecSuite) testFastExitOutput(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "burst-0"
+	execDir := t.TempDir()
+	execStdout, execStderr := createIOFifos(t, execDir)
+
+	var execBuf bytes.Buffer
+	var execMu sync.Mutex
+	// drainFifoIntoDone closes done when the FIFO write end is closed,
+	// which happens after ioShutdown returns (the copy goroutine calls
+	// wc.Close after exiting). We block on this before reading execBuf.
+	drainDone := drainFifoIntoDone(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/burstexit", strconv.Itoa(burstPayloadSize), "0"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("marshal exec spec:", err)
+	}
+
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdout: execStdout,
+		Stderr: execStderr,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec start failed:", err)
+	}
+
+	// Shut down the shim immediately — without waiting for the exec to
+	// finish or calling Delete. This triggers service.shutdown →
+	// c.shutdown → ioShutdown for the exec stream while burstexit is
+	// still running (or has just exited with bytes still in the vsock
+	// receive buffer). The in-VM delete+drain sequence (waitTimeout on
+	// the IO wg) never runs, so the host copy goroutine races against
+	// the connection close.
+	//
+	// We do NOT kill the init first: Kill(All:true) sends SIGKILL to
+	// vminitd itself, which triggers the VM's own shutdown sequence and
+	// tears down the vsock transport before the host can drain it.
+	// Calling Shutdown directly keeps the VM alive long enough for
+	// service.shutdown → c.shutdown → ioShutdown to drain the streams
+	// before s.sb.Stop kills the VM.
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	// Wait for the FIFO reader to reach EOF. ioShutdown (via the copy
+	// goroutine's wc.Close) closes the FIFO write end when the goroutine
+	// exits. On a buggy shim the goroutine exits early on the close
+	// error and drainDone fires before all bytes arrive.
+	select {
+	case <-drainDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for stdout drain after shutdown")
+	}
+
+	execMu.Lock()
+	got := execBuf.Bytes()
+	execMu.Unlock()
+
+	wantCRC := burstExpectedCRC32()
+	if len(got) != burstPayloadSize {
+		t.Fatalf("got %d bytes, want %d (truncated by %d bytes)",
+			len(got), burstPayloadSize, burstPayloadSize-len(got))
+	}
+	gotCRC := crc32.Checksum(got, crc32.MakeTable(crc32.Castagnoli))
+	if gotCRC != wantCRC {
+		t.Fatalf("CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	t.Logf("ok — %d bytes, CRC %08x", len(got), gotCRC)
 }
