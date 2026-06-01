@@ -19,6 +19,7 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"hash/crc32"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,7 @@ func (s *RunSuite) Run(t *testing.T) {
 	t.Run("InitExitCodes", s.testInitExitCodes)
 	t.Run("OutputThenExit", s.testOutputThenExit)
 	t.Run("Events", s.testEvents)
+	t.Run("FastExitInit", s.testFastExitInit)
 }
 
 // testLifecycle drives a container through create / start / state /
@@ -365,4 +367,83 @@ func (s *RunSuite) testEvents(t *testing.T) {
 	if exitEvt.ExitStatus != 0 {
 		t.Errorf("exit event exit status: got %d, want 0", exitEvt.ExitStatus)
 	}
+}
+
+// testFastExitInit runs /bin/burstexit as the container's init process
+// (writes 8 MiB then exits immediately), then tears down the shim via
+// Shutdown without calling Delete first. This forces ioShutdown to run
+// from service.shutdown → container.shutdown rather than the orderly
+// in-VM delete+drain sequence.
+//
+// The race: service.shutdown → c.shutdown → ioShutdown closes the
+// vsock connection while the host copy goroutine may still be blocked
+// in io.CopyBuffer's Read, draining bytes sitting in the kernel socket
+// receive buffer. A buggy shim closes the connection first, causing
+// the goroutine to see "use of closed network connection" and abandon
+// the remaining buffered bytes.
+//
+// A correct shim waits for ioDone (copy goroutines finished) before
+// closing the connections, so the full 8 MiB arrives intact.
+func (s *RunSuite) testFastExitInit(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/burstexit", strconv.Itoa(burstPayloadSize), "0"}, s.cfg)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "run")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	var stdoutBuf bytes.Buffer
+	var stdoutMu sync.Mutex
+	// drainFifoIntoDone closes done when the shim closes the FIFO write
+	// end, which happens only after ioShutdown completes (i.e. after
+	// the copy goroutine calls wc.Close). We must not read stdoutBuf
+	// before that signal.
+	drainDone := drainFifoIntoDone(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	// Shut down via Shutdown immediately after Start — without waiting
+	// for the init to exit and without calling Delete. This triggers
+	// service.shutdown → c.shutdown → ioShutdown while burstexit is
+	// still running (writing its 8 MiB burst) or has just exited with
+	// bytes still buffered in the vsock receive queue. The in-VM
+	// delete+drain sequence (waitTimeout on the IO copy wg) never runs.
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+
+	// Wait for the FIFO reader to reach EOF before inspecting the buffer.
+	select {
+	case <-drainDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for stdout drain after shutdown")
+	}
+
+	stdoutMu.Lock()
+	got := stdoutBuf.Bytes()
+	stdoutMu.Unlock()
+
+	if len(got) != burstPayloadSize {
+		t.Fatalf("got %d bytes, want %d (truncated by %d bytes)",
+			len(got), burstPayloadSize, burstPayloadSize-len(got))
+	}
+	wantCRC := burstExpectedCRC32()
+	gotCRC := crc32.Checksum(got, crc32.MakeTable(crc32.Castagnoli))
+	if gotCRC != wantCRC {
+		t.Fatalf("CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	t.Logf("ok — %d bytes, CRC %08x", len(got), gotCRC)
 }

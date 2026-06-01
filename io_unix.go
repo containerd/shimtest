@@ -120,6 +120,37 @@ func drainFifoInto(tb testing.TB, ctx context.Context, path string, buf *bytes.B
 	tb.Cleanup(func() { f.Close() })
 }
 
+// drainFifoIntoDone opens a FIFO for reading, copies all data into buf
+// (protected by mu), and closes a done channel when the reader goroutine
+// exits (i.e. when the write end is closed). Use this instead of
+// drainFifoInto when the caller needs to block until the FIFO is fully
+// drained before inspecting buf.
+func drainFifoIntoDone(tb testing.TB, ctx context.Context, path string, buf *bytes.Buffer, mu *sync.Mutex) <-chan struct{} {
+	tb.Helper()
+	f, err := fifo.OpenFifo(ctx, path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		tb.Fatal("failed to open fifo:", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b := make([]byte, 4096)
+		for {
+			n, err := f.Read(b)
+			if n > 0 {
+				mu.Lock()
+				buf.Write(b[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	tb.Cleanup(func() { f.Close() })
+	return done
+}
+
 // openPipeWriter opens the write end of a FIFO at path. Used by tests
 // that write to a container's stdin.
 func openPipeWriter(ctx context.Context, path string) (io.WriteCloser, error) {

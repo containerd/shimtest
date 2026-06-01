@@ -3,8 +3,8 @@
 // test suite, invoked either directly (testbin <cmd> [args...]) or
 // via symlink (e.g. /bin/cat -> /bin/testbin).
 //
-// Commands: forever, cat, date, echo, exit, hashverify, layercheck,
-// ls, memhog, nc, tickexit
+// Commands: forever, burstexit, cat, date, echo, exit, hashverify,
+// layercheck, ls, memhog, nc, tickexit
 package main
 
 import (
@@ -41,6 +41,8 @@ func main() {
 	switch cmd {
 	case "forever":
 		cmdForever(args)
+	case "burstexit":
+		cmdBurstexit(args)
 	case "cat":
 		cmdCat(args)
 	case "date":
@@ -367,6 +369,60 @@ func cmdTickexit(_ []string) {
 		time.Sleep(1 * time.Millisecond)
 	}
 	os.Exit(7)
+}
+
+// cmdBurstexit writes a deterministic byte stream of the requested
+// size to stdout as fast as possible, then exits immediately. The
+// stream is a repeating sequence of bytes 0x00..0xff so that any
+// truncation or corruption is detectable by length or content checks.
+//
+// Usage: burstexit <size_bytes> [exit_code]
+//
+// This is used by the FastExitOutput and FastExitInit tests to expose
+// the close-before-drain race in the shim's IO cleanup path: the
+// process exits while bytes are still in-flight through the vsock copy
+// goroutines, and a shim that closes the stream connections before
+// waiting for the goroutines to drain will truncate the output.
+func cmdBurstexit(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: burstexit <size_bytes> [exit_code]")
+		os.Exit(1)
+	}
+	size, err := strconv.Atoi(args[1])
+	if err != nil || size < 0 {
+		fmt.Fprintf(os.Stderr, "burstexit: invalid size %q\n", args[1])
+		os.Exit(1)
+	}
+	exitCode := 0
+	if len(args) >= 3 {
+		exitCode, err = strconv.Atoi(args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "burstexit: invalid exit code %q\n", args[2])
+			os.Exit(1)
+		}
+	}
+
+	// Write in 32 KiB chunks to avoid a single enormous syscall while
+	// still producing output much faster than the vsock copy goroutine
+	// can drain it.
+	const chunkSize = 32 * 1024
+	chunk := make([]byte, chunkSize)
+	for i := 0; i < chunkSize; i++ {
+		chunk[i] = byte(i % 256)
+	}
+
+	remaining := size
+	for remaining > 0 {
+		n := remaining
+		if n > chunkSize {
+			n = chunkSize
+		}
+		if _, err := os.Stdout.Write(chunk[:n]); err != nil {
+			os.Exit(1)
+		}
+		remaining -= n
+	}
+	os.Exit(exitCode)
 }
 
 // cmdNC connects to a unix domain socket and copies bidirectionally
