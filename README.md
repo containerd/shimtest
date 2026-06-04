@@ -92,6 +92,7 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `Lifecycle` | — | Full create/start/kill/wait/delete cycle |
 | `Exec` | exec | Exec a process inside a running container |
 | `StdioRoundTrip` | exec | Write to stdin, read from stdout via exec |
+| `LargeStdioRoundTrip` | exec | Pipe 20 MiB through stdin→`cat`→stdout via exec; verify full byte count and CRC-32. Catches truncation in the exec stdio pipeline under sustained load |
 | `Clock` | exec | Verify VM clock is synchronized with host |
 | `ExitCodes` | exec | Exec processes that exit with a range of status codes and verify propagation |
 | `InitExitCodes` | — | Run the container's init process with `/bin/exit N` and verify task-level exit status propagation |

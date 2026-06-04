@@ -57,6 +57,7 @@ func (s *ExecSuite) Run(t *testing.T) {
 	registerShimLeakCheck(t, s.cfg.ShimBinary)
 	t.Run("Exec", s.testExec)
 	t.Run("StdioRoundTrip", s.testStdioRoundTrip)
+	t.Run("LargeStdioRoundTrip", s.testLargeStdioRoundTrip)
 	t.Run("Clock", s.testClock)
 	t.Run("ExitCodes", s.testExitCodes)
 	t.Run("LargeFileRead", s.testLargeFileRead)
@@ -559,6 +560,155 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 	shutdownTask(ctx, tc, cid)
 }
 
+// testLargeStdioRoundTrip pipes 20 MiB through stdin → /bin/cat →
+// stdout and verifies the full byte count and CRC-32 checksum on the
+// way out. It uses the same deterministic 0x00..0xff tile payload as
+// the FastExit tests.
+//
+// This test asserts that a conforming shim delivers all bytes written
+// to exec stdin to the process and relays all bytes written by the
+// process to stdout back to the host without truncation under sustained
+// load. Two API contracts are verified:
+//
+//   - All stdin bytes must be forwarded to the process before the stdin
+//     connection is closed. A shim that drops buffered bytes on the
+//     stdin close path will produce truncated output from cat.
+//
+//   - All stdout bytes produced by the process must be delivered to the
+//     host before the stdout connection is closed. A shim that drops
+//     buffered bytes when the process exits will produce truncated
+//     output.
+//
+// Both failure modes are detected by the byte-count and CRC-32
+// assertions at the end of the test.
+func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "large-rt"
+	execDir := t.TempDir()
+	execStdin, execStdout, execStderr := createStdioFifos(t, execDir)
+
+	stdoutReader, err := openPipeReader(ctx, execStdout)
+	if err != nil {
+		t.Fatal("open stdout reader:", err)
+	}
+	t.Cleanup(func() { stdoutReader.Close() })
+
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	var byteCount int64
+	outDone := make(chan struct{})
+	go func() {
+		defer close(outDone)
+		byteCount, _ = io.Copy(h, stdoutReader)
+	}()
+
+	drainFifo(t, ctx, execStderr)
+
+	stdinFifo, err := openPipeWriter(ctx, execStdin)
+	if err != nil {
+		t.Fatal("open stdin pipe:", err)
+	}
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/cat"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("marshal exec spec:", err)
+	}
+
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdin:  execStdin,
+		Stdout: execStdout,
+		Stderr: execStderr,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec start failed:", err)
+	}
+
+	// Stream the tiled payload to stdin without allocating the full buffer.
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(stdinFifo, io.LimitReader(&infiniteTileReader{}, int64(largeStdioPayloadSize)))
+		stdinFifo.Close() // close signals EOF to cat
+		writeDone <- err
+	}()
+
+	// Wait for all stdin to be written before proceeding.
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal("write to stdin failed:", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("timed out writing stdin payload")
+	}
+
+	// Wait for cat to exit (it exits when stdin is closed).
+	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID, ExecID: execID})
+	if err != nil {
+		t.Fatal("exec wait failed:", err)
+	}
+	if waitResp.ExitStatus != 0 {
+		t.Fatalf("cat exited with status %d", waitResp.ExitStatus)
+	}
+
+	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec delete failed:", err)
+	}
+
+	// Wait for the stdout reader to reach EOF.
+	select {
+	case <-outDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for stdout drain")
+	}
+
+	if byteCount != int64(largeStdioPayloadSize) {
+		t.Fatalf("got %d bytes, want %d (truncated by %d bytes)",
+			byteCount, largeStdioPayloadSize, int64(largeStdioPayloadSize)-byteCount)
+	}
+	gotCRC := h.Sum32()
+	if wantCRC := tiledPayloadCRC32(largeStdioPayloadSize); gotCRC != wantCRC {
+		t.Fatalf("CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	t.Logf("ok — %d bytes, CRC %08x", byteCount, gotCRC)
+
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+}
 
 // burstPayloadSize is the number of bytes written by /bin/burstexit in
 // the FastExitOutput and FastExitInit tests. It must be large enough
@@ -572,17 +722,32 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 // io.CopyBuffer.
 const burstPayloadSize = 8 * 1024 * 1024
 
-// burstExpectedCRC32 returns the Castagnoli CRC-32 of the deterministic
-// byte stream produced by /bin/burstexit: a repeating 0x00..0xff tile
-// of exactly burstPayloadSize bytes.
-func burstExpectedCRC32() uint32 {
-	tile := make([]byte, 256)
+// largeStdioPayloadSize is the number of bytes piped through the
+// LargeStdioRoundTrip test. Larger than burstPayloadSize to stress the
+// shim's in-flight buffering more aggressively.
+const largeStdioPayloadSize = 20 * 1024 * 1024
+
+// tiledPayload builds a repeating 0x00..0xff tiled payload of the given
+// size. This matches the byte stream produced by /bin/burstexit and is
+// shared between the exec and stress suite tests.
+func tiledPayload(size int) []byte {
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	return payload
+}
+
+// tiledPayloadCRC32 returns the Castagnoli CRC-32 of a tiled payload of
+// the given size without allocating the full payload. Used when only the
+// expected checksum is needed (e.g. verifying /bin/burstexit output).
+func tiledPayloadCRC32(size int) uint32 {
+	var tile [256]byte
 	for i := range tile {
 		tile[i] = byte(i)
 	}
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	remaining := burstPayloadSize
-	for remaining > 0 {
+	for remaining := size; remaining > 0; {
 		n := remaining
 		if n > len(tile) {
 			n = len(tile)
@@ -591,6 +756,25 @@ func burstExpectedCRC32() uint32 {
 		remaining -= n
 	}
 	return h.Sum32()
+}
+
+// burstExpectedCRC32 returns the Castagnoli CRC-32 of the deterministic
+// tiled payload of exactly burstPayloadSize bytes.
+func burstExpectedCRC32() uint32 {
+	return tiledPayloadCRC32(burstPayloadSize)
+}
+
+// infiniteTileReader emits an infinite repeating 0x00..0xff tile stream.
+// Wrap with io.LimitReader to produce a payload of exactly n bytes without
+// allocating the full buffer.
+type infiniteTileReader struct{ off int64 }
+
+func (r *infiniteTileReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte((r.off + int64(i)) % 256)
+	}
+	r.off += int64(len(p))
+	return len(p), nil
 }
 
 // testFastExitOutput execs /bin/burstexit (writes 8 MiB then exits)
