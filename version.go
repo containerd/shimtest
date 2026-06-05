@@ -19,4 +19,4 @@ package shimtest
 // testbinVersion is the version used to fetch testbin from GitHub Releases
 // when testdata/testbin is absent. It must match the git tag when tagging a
 // release — the pre-push hook in .githooks/pre-push enforces this.
-const testbinVersion = "v0.1.5"
+const testbinVersion = "v0.1.7"
