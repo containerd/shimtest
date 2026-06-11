@@ -366,7 +366,17 @@ func parseBootstrapResult(data []byte, params *bootstrapParams) error {
 func startShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) bootstrapParams {
 	tb.Helper()
 
-	socketDir, err := os.MkdirTemp("", "nb-")
+	// On macOS, AF_UNIX paths are limited to 104 bytes. The shim derives its
+	// socket path as socketDir + "/" + sha256(…) (64 hex chars). When socketDir
+	// lives under the default $TMPDIR (/var/folders/…, often >35 chars) the
+	// combined path exceeds 104 bytes and the shim's bind(2) fails.
+	// Use /tmp directly on macOS so the socket path stays well within the limit:
+	//   len("/tmp/nb-XXXXXXXX") + 1 + 64 = ~82 bytes < 104.
+	socketDirBase := ""
+	if runtime.GOOS == "darwin" {
+		socketDirBase = "/tmp"
+	}
+	socketDir, err := os.MkdirTemp(socketDirBase, "nb-")
 	if err != nil {
 		tb.Fatal("failed to create socket dir:", err)
 	}
