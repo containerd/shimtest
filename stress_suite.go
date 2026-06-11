@@ -178,7 +178,9 @@ func doFullLifecycle(t *testing.T, baseCtx context.Context, cfg Config, ttrpcClo
 	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid}); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	if _, err := tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: cid}); err != nil {
+	shutCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+	defer cancel()
+	if _, err := tc.Shutdown(shutCtx, &taskAPI.ShutdownRequest{ID: cid}); err != nil {
 		if strings.Contains(err.Error(), "ttrpc: closed") {
 			ttrpcClosedOnShutdown.Add(1)
 		} else {
