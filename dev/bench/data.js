@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781161017457,
+  "lastUpdate": 1781161018546,
   "repoUrl": "https://github.com/dmcgowan/shimtest",
   "entries": {
     "runc rootless / containerd v2.3.0-beta.2": [
@@ -8002,6 +8002,126 @@ window.BENCHMARK_DATA = {
           {
             "name": "BenchmarkShim/runc/ReadBindMount - MB/s",
             "value": 2957,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "derek@mcg.dev",
+            "name": "Derek McGowan",
+            "username": "dmcgowan"
+          },
+          "committer": {
+            "email": "derek@mcg.dev",
+            "name": "Derek McGowan",
+            "username": "dmcgowan"
+          },
+          "distinct": true,
+          "id": "e77d6bc026f632820b1331a2da6c55cd02947e51",
+          "message": "Update stress timeout handling on macOS\n\nSigned-off-by: Derek McGowan <derek@mcg.dev>",
+          "timestamp": "2026-06-10T23:52:35-07:00",
+          "tree_id": "427f7db6f57a370fcb058a7241bc6c16cff22d21",
+          "url": "https://github.com/dmcgowan/shimtest/commit/e77d6bc026f632820b1331a2da6c55cd02947e51"
+        },
+        "date": 1781161018338,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkShim/runc/Lifecycle",
+            "value": 72471336,
+            "unit": "ns/op\t        19.69 ms/create\t        33.43 ms/delete\t         5.396 ms/kill\t         3.525 ms/shim-start\t         5.200 ms/start\t         5.227 ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ns/op",
+            "value": 72471336,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/create",
+            "value": 19.69,
+            "unit": "ms/create",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/delete",
+            "value": 33.43,
+            "unit": "ms/delete",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/kill",
+            "value": 5.396,
+            "unit": "ms/kill",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/shim-start",
+            "value": 3.525,
+            "unit": "ms/shim-start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/start",
+            "value": 5.2,
+            "unit": "ms/start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Lifecycle - ms/wait",
+            "value": 5.227,
+            "unit": "ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Startup",
+            "value": 32909140,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/Exec",
+            "value": 13120080,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadLargeFile",
+            "value": 20135925,
+            "unit": "ns/op\t3332.79 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadLargeFile - ns/op",
+            "value": 20135925,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadLargeFile - MB/s",
+            "value": 3332.79,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadBindMount",
+            "value": 19510027,
+            "unit": "ns/op\t3439.71 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadBindMount - ns/op",
+            "value": 19510027,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc/ReadBindMount - MB/s",
+            "value": 3439.71,
             "unit": "MB/s",
             "extra": "5 times\n4 procs"
           }
