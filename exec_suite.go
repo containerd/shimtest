@@ -63,6 +63,7 @@ func (s *ExecSuite) Run(t *testing.T) {
 	t.Run("LargeFileRead", s.testLargeFileRead)
 	t.Run("BindMountRead", s.testBindMountRead)
 	t.Run("FastExitOutput", s.testFastExitOutput)
+	t.Run("ExecOutputDrainAfterExit", s.testExecOutputDrainAfterExit)
 }
 
 // TestExec runs `echo execworks` inside a container and verifies the
@@ -877,6 +878,117 @@ func (s *ExecSuite) testFastExitOutput(t *testing.T) {
 	case <-drainDone:
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for stdout drain after shutdown")
+	}
+
+	execMu.Lock()
+	got := execBuf.Bytes()
+	execMu.Unlock()
+
+	wantCRC := burstExpectedCRC32()
+	if len(got) != burstPayloadSize {
+		t.Fatalf("got %d bytes, want %d (truncated by %d bytes)",
+			len(got), burstPayloadSize, burstPayloadSize-len(got))
+	}
+	gotCRC := crc32.Checksum(got, crc32.MakeTable(crc32.Castagnoli))
+	if gotCRC != wantCRC {
+		t.Fatalf("CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	t.Logf("ok — %d bytes, CRC %08x", len(got), gotCRC)
+}
+
+// testExecOutputDrainAfterExit verifies that a conforming shim promptly
+// closes the exec process's stdout connection when the process exits,
+// allowing Shutdown to complete without waiting for the 30 s ioShutdown
+// fallback.
+//
+// The init container is started with null (empty) stdout/stderr so that
+// init's stdio shutdown completes instantly and does not consume the
+// shared 30 s shutdown deadline. This isolates the exec's stdio close
+// as the sole determinant of total Shutdown duration.
+//
+// A non-conforming shim that fails to propagate the write-end close of
+// the exec's stdout back to the host will leave the host copy goroutine
+// blocked until the 30 s fallback fires; Shutdown will exceed the 5 s
+// assertion and the test will fail on the duration check.
+func (s *ExecSuite) testExecOutputDrainAfterExit(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+
+	// Start the init container with null stdout/stderr so its stdio
+	// shutdown completes instantly. If we used real FIFOs, /bin/forever
+	// (which never writes) would hold stdout open, consuming the shared
+	// 30 s shutdown deadline before exec's ioShutdown even starts.
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, "", "", rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "drain-0"
+	execDir := t.TempDir()
+	execStdout, execStderr := createIOFifos(t, execDir)
+
+	var execBuf bytes.Buffer
+	var execMu sync.Mutex
+	drainDone := drainFifoIntoDone(t, ctx, execStdout, &execBuf, &execMu)
+	drainFifo(t, ctx, execStderr)
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/burstexit", strconv.Itoa(burstPayloadSize), "0"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("marshal exec spec:", err)
+	}
+
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdout: execStdout,
+		Stderr: execStderr,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec start failed:", err)
+	}
+
+	// Time the Shutdown call. With null init IO, the only remaining wait
+	// is exec's stdio shutdown — which is the variable under test. A
+	// conforming shim closes the exec's stdout connection promptly when
+	// the process exits; ioDone fires in milliseconds and Shutdown
+	// returns well within the 5 s bound.
+	shutdownStart := time.Now()
+	tc.Shutdown(ctx, &taskAPI.ShutdownRequest{ID: containerID})
+	elapsed := time.Since(shutdownStart)
+
+	// 5 s is well above sub-second propagation on a correct shim and well
+	// below the 30 s shared shutdown-context deadline.
+	const maxShutdownDuration = 5 * time.Second
+	if elapsed > maxShutdownDuration {
+		t.Fatalf("Shutdown blocked for %v (> %v): shim did not propagate exec stdout close — ioShutdown 30s fallback is masking the root cause",
+			elapsed.Round(time.Millisecond), maxShutdownDuration)
+	}
+
+	select {
+	case <-drainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout FIFO did not drain within 2s after Shutdown returned")
 	}
 
 	execMu.Lock()
