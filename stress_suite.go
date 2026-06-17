@@ -243,6 +243,15 @@ const (
 // quickly exits the child. Its working set stays small. Any per-exec
 // retention beyond 64 MiB is a genuine leak.
 //
+// # macOS (128 MiB)
+//
+// One-time pool allocations (Go runtime heap watermark, HVF VM state,
+// virtio device buffers) produce an expected RSS step of ~100 MiB that
+// saturates early in the run rather than growing linearly with exec
+// count. 128 MiB = ~1.3× the observed peak step, large enough to
+// absorb OS page-cache fluctuation while still catching a true
+// per-exec leak at the observed rate of ~5 KB/exec within 10 minutes.
+//
 // # Windows (384 MiB)
 //
 // The shim hosts the krun VM in-process: krun.dll is loaded, vCPU and
@@ -269,10 +278,14 @@ const (
 // before the threshold is crossed, while giving headroom for the
 // one-time pool growth.
 var stressMaxRSSGrowth = func() int64 {
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		return 384 << 20 // 384 MiB — see comment above
+	case "darwin":
+		return 128 << 20 // 128 MiB — see comment above
+	default:
+		return 64 << 20 // 64 MiB — Linux runc shim is lightweight
 	}
-	return 64 << 20 // 64 MiB — Linux runc shim is lightweight
 }()
 
 // stressGuestMemSampleInterval is how often the exec stress test
