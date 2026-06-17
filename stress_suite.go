@@ -22,9 +22,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
+	"math/rand/v2"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -195,6 +198,41 @@ func doFullLifecycle(t *testing.T, baseCtx context.Context, cfg Config, ttrpcClo
 // to complete before the next iteration starts.
 const stressExecConcurrency = 4
 
+// stressExecSeed is the fixed PRNG seed for the payload-size sequence
+// used in the burstexit and round-trip exec stress variants. A fixed
+// seed makes each test run produce the same size sequence, so failures
+// are reproducible without any extra flags.
+const stressExecSeed uint64 = 42
+
+// stressExecMinSize and stressExecMaxSize bound the pseudo-random
+// payload size (in bytes) chosen per iteration for the burstexit and
+// round-trip exec stress variants.
+const (
+	stressExecMinSize = 32 * 1024        // 32 KiB
+	stressExecMaxSize = 32 * 1024 * 1024 // 32 MiB
+)
+
+// stressExecKind identifies which exec variant a stress iteration runs.
+// Iterations cycle through the kinds in declaration order so that every
+// few iterations exercise a different part of the shim's exec pipeline.
+type stressExecKind uint8
+
+const (
+	// stressExecKindEcho execs /bin/echo. No data-integrity check;
+	// verifies only that the process completes successfully.
+	stressExecKindEcho stressExecKind = iota
+	// stressExecKindBurstexit execs /bin/burstexit with a pseudo-random
+	// payload size. The process writes the tiled payload to stdout and
+	// exits immediately; the test verifies the full byte count and
+	// CRC-32. Exercises the shim's close-before-drain path.
+	stressExecKindBurstexit
+	// stressExecKindRoundTrip execs /bin/cat with a pseudo-random
+	// payload piped via stdin and read back from stdout. Verifies byte
+	// count and CRC-32. Exercises both stdin delivery and stdout drain.
+	stressExecKindRoundTrip
+	stressExecKindCount
+)
+
 // stressMaxRSSGrowth is the upper bound on shim RSS growth between
 // the start and end of the exec stress run. Crossing this threshold
 // indicates an unbounded leak in the shim's per-exec bookkeeping.
@@ -272,13 +310,21 @@ func (s *StressSuite) testExec(t *testing.T) {
 		t.Logf("guest memory sampling unavailable: %v", guestBeforeErr)
 	}
 
-	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+	echoSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
 		Args: []string{"/bin/echo", "execstress"},
 		Cwd:  "/",
 		Env:  []string{"PATH=/bin:/usr/bin"},
 	})
 	if err != nil {
 		t.Fatal("marshal exec spec:", err)
+	}
+
+	// Seeded PRNG for payload sizes. Sizes are computed in the main
+	// goroutine before each iteration's goroutines are spawned so the
+	// sequence is deterministic regardless of goroutine scheduling.
+	rng := rand.New(rand.NewPCG(stressExecSeed, 0))
+	nextSize := func() int {
+		return stressExecMinSize + rng.IntN(stressExecMaxSize-stressExecMinSize+1)
 	}
 
 	ctx, cancel := stressCtx(t, env.ctx)
@@ -317,21 +363,33 @@ func (s *StressSuite) testExec(t *testing.T) {
 		}
 	}()
 
+	numKinds := int64(stressExecKindCount)
 	var iterIdx atomic.Int64
 	iters, elapsed, runErr := runStress(ctx, func(ctx context.Context) error {
 		i := iterIdx.Add(1)
+		kind := stressExecKind((i - 1) % numKinds)
+
 		var wg sync.WaitGroup
 		var firstErr atomic.Pointer[error]
 		for j := 0; j < stressExecConcurrency; j++ {
 			wg.Add(1)
-			go func(j int) {
+			go func(j, size int) {
 				defer wg.Done()
 				execID := fmt.Sprintf("e-%d-%d", i, j)
-				if err := runOneExec(ctx, env, execID, procSpec); err != nil {
+				var err error
+				switch kind {
+				case stressExecKindEcho:
+					err = runOneExec(ctx, env, execID, echoSpec)
+				case stressExecKindBurstexit:
+					err = runExecBurstexit(ctx, env, execID, size)
+				case stressExecKindRoundTrip:
+					err = runExecRoundTrip(ctx, env, execID, size)
+				}
+				if err != nil {
 					e := err
 					firstErr.CompareAndSwap(nil, &e)
 				}
-			}(j)
+			}(j, nextSize())
 		}
 		wg.Wait()
 		if e := firstErr.Load(); e != nil {
@@ -346,7 +404,7 @@ func (s *StressSuite) testExec(t *testing.T) {
 	guestAfter, guestAfterErr := readGuestMem(env.ctx, env, nextGuestMemID())
 
 	rate := float64(iters*stressExecConcurrency) / elapsed.Seconds()
-	t.Logf("exec: %d iterations × %d execs in %s (%.0f exec/s); host rss %d → %d (Δ %+d)",
+	t.Logf("exec: %d iterations × %d execs in %s (%.0f exec/s); kinds: echo/burstexit/roundtrip cycling; host rss %d → %d (Δ %+d)",
 		iters, stressExecConcurrency, elapsed.Round(time.Millisecond),
 		rate, rssBefore, rssAfter, rssAfter-rssBefore)
 
@@ -489,6 +547,205 @@ func captureExec(parentCtx context.Context, env *shimEnv, execID string, procSpe
 		return "", fmt.Errorf("delete exec: %w", err)
 	}
 	return outBuf.String(), nil
+}
+
+// runExecBurstexit runs a single /bin/burstexit exec inside the shared
+// container, captures its stdout, and verifies the full byte count and
+// CRC-32 of the tiled payload. size is the number of bytes to request.
+func runExecBurstexit(parentCtx context.Context, env *shimEnv, execID string, size int) error {
+	subCtx, cancel := context.WithTimeout(parentCtx, stressIterationTimeout)
+	defer cancel()
+
+	dir, err := os.MkdirTemp("", "stress-burst-")
+	if err != nil {
+		return fmt.Errorf("mkdtemp: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	stdoutPath, stdout, cleanupStdout, err := createRawPipe(dir, "stdout")
+	if err != nil {
+		return fmt.Errorf("create stdout pipe: %w", err)
+	}
+	defer cleanupStdout()
+
+	stderrPath, stderr, cleanupStderr, err := createRawPipe(dir, "stderr")
+	if err != nil {
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+	defer cleanupStderr()
+
+	go io.Copy(io.Discard, stderr)
+
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	var (
+		byteCount int64
+		gotCRC    uint32
+	)
+	outDone := make(chan error, 1)
+	go func() {
+		n, err := io.Copy(h, stdout)
+		byteCount = n
+		gotCRC = h.Sum32()
+		outDone <- err
+	}()
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/burstexit", strconv.Itoa(size), "0"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal exec spec: %w", err)
+	}
+
+	if _, err := env.tc.Exec(subCtx, &taskAPI.ExecProcessRequest{
+		ID:     env.containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdout: stdoutPath,
+		Stderr: stderrPath,
+	}); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	if _, err := env.tc.Start(subCtx, &taskAPI.StartRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("start exec: %w", err)
+	}
+	if _, err := env.tc.Wait(subCtx, &taskAPI.WaitRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	if _, err := env.tc.Delete(subCtx, &taskAPI.DeleteRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("delete exec: %w", err)
+	}
+
+	select {
+	case readErr := <-outDone:
+		if readErr != nil {
+			return fmt.Errorf("stdout read: %w", readErr)
+		}
+	case <-subCtx.Done():
+		return fmt.Errorf("stdout drain timed out after Delete: %w", subCtx.Err())
+	}
+
+	if byteCount != int64(size) {
+		return fmt.Errorf("stdout truncated: got %d bytes, want %d", byteCount, size)
+	}
+	if wantCRC := tiledPayloadCRC32(size); gotCRC != wantCRC {
+		return fmt.Errorf("stdout CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	return nil
+}
+
+// runExecRoundTrip runs a single /bin/cat exec inside the shared
+// container, writes size bytes of tiled payload to its stdin, and
+// verifies that all bytes are echoed back on stdout with the correct
+// CRC-32. Exercises both stdin delivery and stdout drain.
+func runExecRoundTrip(parentCtx context.Context, env *shimEnv, execID string, size int) error {
+	subCtx, cancel := context.WithTimeout(parentCtx, stressIterationTimeout)
+	defer cancel()
+
+	dir, err := os.MkdirTemp("", "stress-rt-")
+	if err != nil {
+		return fmt.Errorf("mkdtemp: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	stdinPath, stdin, cleanupStdin, err := createRawPipeWriter(dir, "stdin")
+	if err != nil {
+		return fmt.Errorf("create stdin pipe: %w", err)
+	}
+	defer cleanupStdin()
+
+	stdoutPath, stdout, cleanupStdout, err := createRawPipe(dir, "stdout")
+	if err != nil {
+		return fmt.Errorf("create stdout pipe: %w", err)
+	}
+	defer cleanupStdout()
+
+	stderrPath, stderr, cleanupStderr, err := createRawPipe(dir, "stderr")
+	if err != nil {
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+	defer cleanupStderr()
+
+	go io.Copy(io.Discard, stderr)
+
+	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	var (
+		byteCount int64
+		gotCRC    uint32
+	)
+	outDone := make(chan error, 1)
+	go func() {
+		n, err := io.Copy(h, stdout)
+		byteCount = n
+		gotCRC = h.Sum32()
+		outDone <- err
+	}()
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/cat"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal exec spec: %w", err)
+	}
+
+	if _, err := env.tc.Exec(subCtx, &taskAPI.ExecProcessRequest{
+		ID:     env.containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdin:  stdinPath,
+		Stdout: stdoutPath,
+		Stderr: stderrPath,
+	}); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	if _, err := env.tc.Start(subCtx, &taskAPI.StartRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("start exec: %w", err)
+	}
+
+	// Stream the tiled payload to stdin without allocating the full
+	// buffer; closing stdin signals EOF to /bin/cat, causing it to exit.
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(stdin, io.LimitReader(&infiniteTileReader{}, int64(size)))
+		stdin.Close()
+		writeDone <- err
+	}()
+
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return fmt.Errorf("write stdin: %w", err)
+		}
+	case <-subCtx.Done():
+		return fmt.Errorf("stdin write timed out: %w", subCtx.Err())
+	}
+
+	if _, err := env.tc.Wait(subCtx, &taskAPI.WaitRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	if _, err := env.tc.Delete(subCtx, &taskAPI.DeleteRequest{ID: env.containerID, ExecID: execID}); err != nil {
+		return fmt.Errorf("delete exec: %w", err)
+	}
+
+	select {
+	case readErr := <-outDone:
+		if readErr != nil {
+			return fmt.Errorf("stdout read: %w", readErr)
+		}
+	case <-subCtx.Done():
+		return fmt.Errorf("stdout drain timed out after Delete: %w", subCtx.Err())
+	}
+
+	if byteCount != int64(size) {
+		return fmt.Errorf("stdout truncated: got %d bytes, want %d", byteCount, size)
+	}
+	if wantCRC := tiledPayloadCRC32(size); gotCRC != wantCRC {
+		return fmt.Errorf("stdout CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
+	}
+	return nil
 }
 
 // readGuestMem execs /bin/cat /proc/meminfo inside the container and

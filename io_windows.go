@@ -307,6 +307,33 @@ type rawPipeState struct {
 	pw *io.PipeWriter
 }
 
+// createRawPipeWriter creates a Windows named-pipe server and returns its
+// path, a WriteCloser for the write end (host → shim direction), and a
+// cleanup function. The shim connects as the client and reads from the pipe.
+// Used in contexts without a testing.TB (e.g. runExecRoundTrip in stress_suite.go).
+func createRawPipeWriter(_, name string) (path string, w io.WriteCloser, cleanup func(), err error) {
+	path = `\\.\pipe\shimtest-raw-` + name + `-` + randomSuffix()
+	l, err := winio.ListenPipe(path, pipeCfg)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("ListenPipe %s: %w", path, err)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			pr.CloseWithError(err)
+			return
+		}
+		defer c.Close()
+		io.Copy(c, pr)
+	}()
+	cleanup = func() {
+		l.Close()
+		pw.Close()
+	}
+	return path, pw, cleanup, nil
+}
+
 // createRawPipe creates a named-pipe server and returns its path, a
 // ReadCloser for the read end, and a cleanup function. Used in contexts
 // without a testing.TB (e.g. runOneExec in stress_suite.go).
