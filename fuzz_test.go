@@ -20,7 +20,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/dmcgowan/shimtest"
+	"github.com/containerd/shimtest"
 )
 
 // FuzzTransferMissing is the local JSON-driven entry point that

@@ -36,7 +36,7 @@ import (
 	erofs "github.com/erofs/go-erofs"
 )
 
-const shimtestModulePath = "github.com/dmcgowan/shimtest"
+const shimtestModulePath = "github.com/containerd/shimtest"
 
 // testbinOS is the OS for which testbin is always built. Regardless of the
 // host running the tests, the container binary is always a Linux ELF.

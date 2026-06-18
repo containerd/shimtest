@@ -1,4 +1,4 @@
-module github.com/dmcgowan/shimtest
+module github.com/containerd/shimtest
 
 go 1.26.3
 

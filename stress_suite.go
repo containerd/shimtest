@@ -42,7 +42,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/dmcgowan/shimtest/internal/transfer"
+	"github.com/containerd/shimtest/internal/transfer"
 )
 
 // StressSuite contains long-running stress tests that exercise the

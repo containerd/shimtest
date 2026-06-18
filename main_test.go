@@ -31,7 +31,7 @@ import (
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/dmcgowan/shimtest"
+	"github.com/containerd/shimtest"
 )
 
 // runConfig is the JSON-driven configuration used by this package's

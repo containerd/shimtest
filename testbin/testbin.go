@@ -6,7 +6,7 @@
 //
 //	package main
 //
-//	import "github.com/dmcgowan/shimtest/internal/testbin"
+//	import "github.com/containerd/shimtest/internal/testbin"
 //
 //	func main() { testbin.Main() }
 package testbin

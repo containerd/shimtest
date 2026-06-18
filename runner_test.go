@@ -20,7 +20,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/dmcgowan/shimtest"
+	"github.com/containerd/shimtest"
 )
 
 // TestShim is the local JSON-driven runner. For each configured

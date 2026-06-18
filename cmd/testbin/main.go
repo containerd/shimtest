@@ -7,6 +7,6 @@
 // layercheck, ls, memhog, nc, tickexit
 package main
 
-import "github.com/dmcgowan/shimtest/testbin"
+import "github.com/containerd/shimtest/testbin"
 
 func main() { testbin.Main() }
