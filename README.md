@@ -5,6 +5,8 @@ lifecycle (create, start, exec, kill, delete), stdio round-trip, clock
 synchronization across a VM boundary, the transfer service, and UDS socket
 forwarding.
 
+shimtest is part of the [nerdbox](https://github.com/containerd/nerdbox) non-core sub-project of [containerd](https://github.com/containerd).
+
 ## Prerequisites
 
 - A built shim binary (e.g., `containerd-shim-runc-v2` or
@@ -132,7 +134,7 @@ Candidates to add later, ranked roughly by value:
 
 A subset of these benchmarks runs against `runc-rootless` and `nerdbox`
 on every push to `main` and is published as time-series charts at
-<https://dmcgowan.github.io/shimtest/dev/bench/> (gh-pages).
+<https://containerd.github.io/shimtest/dev/bench/> (gh-pages).
 
 
 Benchmarks live under `BenchmarkShim/<config-name>/<bench-name>`.
@@ -169,7 +171,7 @@ that points at your binary, then run `shimtest.test` against it.
 - name: Check out shimtest
   uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   with:
-    repository: dmcgowan/shimtest
+    repository: containerd/shimtest
     ref: <commit-sha>   # pin a commit
     path: shimtest
 
