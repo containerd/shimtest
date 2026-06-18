@@ -390,7 +390,7 @@ func extractErofsIntoDir(tb testing.TB, imgPath, dir string) {
 		if err != nil {
 			return err
 		}
-		src, err := img.(fs.FS).Open(path)
+		src, err := img.Open(path)
 		if err != nil {
 			return err
 		}

@@ -43,7 +43,6 @@ import (
 // hashverify.
 type ExecSuite struct {
 	cfg Config
-	
 }
 
 // NewExecSuite constructs an ExecSuite from the given options.
