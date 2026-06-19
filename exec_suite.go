@@ -579,6 +579,15 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 //     buffered bytes when the process exits will produce truncated
 //     output.
 //
+// Stdin is closed via the CloseIO RPC, not by simply closing the
+// client-side FIFO write end. This matches how containerd itself signals
+// EOF: the shim holds its own write-end reference on the stdin FIFO (to
+// unblock its internal O_RDONLY open) and only releases it when it
+// receives a CloseIO request. Closing the test's write end alone leaves
+// the shim's reference open, so cat never sees EOF. The CloseIO RPC
+// instructs the shim to drop its reference, delivering EOF to the
+// process — exactly the protocol used by `ctr exec`.
+//
 // Both failure modes are detected by the byte-count and CRC-32
 // assertions at the end of the test.
 func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
@@ -656,26 +665,45 @@ func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
 		t.Fatal("exec start failed:", err)
 	}
 
-	// Stream the tiled payload to stdin in a background goroutine.
-	// Closing the write end signals EOF to cat, causing it to exit.
-	//
-	// We must not block here waiting for the write to finish before
-	// calling tc.Wait: the stdin write pushes data through the shim
-	// into cat, which writes it back through stdout. If the shim's
-	// internal stdout buffer fills before we call tc.Wait (which
-	// drives the read side), the write stalls and we deadlock.
-	// Running the write, the Wait, and the stdout drain concurrently
-	// keeps all three pipes flowing.
+	// Write the tiled payload to stdin in a background goroutine.
+	// The write and the stdout drain run concurrently so that neither
+	// the stdin FIFO nor cat's stdout pipe can fill and deadlock.
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(stdinFifo, io.LimitReader(&infiniteTileReader{}, int64(largeStdioPayloadSize)))
-		stdinFifo.Close() // close signals EOF to cat
+		stdinFifo.Close()
 		writeDone <- err
 	}()
 
+	// Wait for all stdin to be written.
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal("write to stdin failed:", err)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatal("timed out writing stdin payload")
+	}
+
+	// Signal EOF to the in-container process via the CloseIO RPC.
+	//
+	// Closing the client-side FIFO write end alone is not sufficient:
+	// the shim holds its own write-end reference on the stdin FIFO
+	// (opened in openStdin to unblock the shim's internal O_RDONLY
+	// open) and releases it only when it receives a CloseIO request.
+	// This matches the protocol used by containerd and `ctr exec`:
+	// the client calls CloseIO after it is done writing stdin, which
+	// causes the shim to close its write reference and deliver EOF to
+	// the process.
+	if _, err := tc.CloseIO(ctx, &taskAPI.CloseIORequest{
+		ID:     containerID,
+		ExecID: execID,
+		Stdin:  true,
+	}); err != nil {
+		t.Fatal("CloseIO failed:", err)
+	}
+
 	// Wait for cat to exit (it exits once stdin reaches EOF).
-	// This runs concurrently with both the stdin write goroutine
-	// above and the stdout drain goroutine started earlier.
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID, ExecID: execID})
 	if err != nil {
 		t.Fatal("exec wait failed:", err)
