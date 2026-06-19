@@ -656,7 +656,16 @@ func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
 		t.Fatal("exec start failed:", err)
 	}
 
-	// Stream the tiled payload to stdin without allocating the full buffer.
+	// Stream the tiled payload to stdin in a background goroutine.
+	// Closing the write end signals EOF to cat, causing it to exit.
+	//
+	// We must not block here waiting for the write to finish before
+	// calling tc.Wait: the stdin write pushes data through the shim
+	// into cat, which writes it back through stdout. If the shim's
+	// internal stdout buffer fills before we call tc.Wait (which
+	// drives the read side), the write stalls and we deadlock.
+	// Running the write, the Wait, and the stdout drain concurrently
+	// keeps all three pipes flowing.
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(stdinFifo, io.LimitReader(&infiniteTileReader{}, int64(largeStdioPayloadSize)))
@@ -664,23 +673,27 @@ func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
 		writeDone <- err
 	}()
 
-	// Wait for all stdin to be written before proceeding.
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatal("write to stdin failed:", err)
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("timed out writing stdin payload")
-	}
-
-	// Wait for cat to exit (it exits when stdin is closed).
+	// Wait for cat to exit (it exits once stdin reaches EOF).
+	// This runs concurrently with both the stdin write goroutine
+	// above and the stdout drain goroutine started earlier.
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID, ExecID: execID})
 	if err != nil {
 		t.Fatal("exec wait failed:", err)
 	}
 	if waitResp.ExitStatus != 0 {
 		t.Fatalf("cat exited with status %d", waitResp.ExitStatus)
+	}
+
+	// Confirm the stdin write completed without error.
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal("write to stdin failed:", err)
+		}
+	case <-time.After(5 * time.Second):
+		// The write goroutine should have finished before or shortly
+		// after cat exited; a long delay here indicates a bug.
+		t.Fatal("stdin write goroutine did not finish after cat exited")
 	}
 
 	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
