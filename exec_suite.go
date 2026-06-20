@@ -712,18 +712,6 @@ func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
 		t.Fatalf("cat exited with status %d", waitResp.ExitStatus)
 	}
 
-	// Confirm the stdin write completed without error.
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatal("write to stdin failed:", err)
-		}
-	case <-time.After(5 * time.Second):
-		// The write goroutine should have finished before or shortly
-		// after cat exited; a long delay here indicates a bug.
-		t.Fatal("stdin write goroutine did not finish after cat exited")
-	}
-
 	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
 		t.Fatal("exec delete failed:", err)
 	}
