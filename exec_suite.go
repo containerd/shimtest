@@ -588,6 +588,12 @@ func (s *ExecSuite) runHashverify(t *testing.T, path, hashHex string, extraMount
 // instructs the shim to drop its reference, delivering EOF to the
 // process — exactly the protocol used by `ctr exec`.
 //
+// A third API contract is also verified: the shim must close the exec's
+// stdout connection once the process exits and its output has been
+// flushed, without waiting for the caller to issue Delete. The test
+// waits for stdout EOF before calling Delete; a shim that defers the
+// stdout close until Delete will time out here.
+//
 // Both failure modes are detected by the byte-count and CRC-32
 // assertions at the end of the test.
 func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
@@ -712,15 +718,22 @@ func (s *ExecSuite) testLargeStdioRoundTrip(t *testing.T) {
 		t.Fatalf("cat exited with status %d", waitResp.ExitStatus)
 	}
 
-	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
-		t.Fatal("exec delete failed:", err)
-	}
-
-	// Wait for the stdout reader to reach EOF.
+	// Wait for the stdout reader to reach EOF before calling Delete.
+	//
+	// A conforming shim must close the exec's stdout connection once
+	// the process exits and its output has been flushed — it must not
+	// defer closing stdout until Delete is called. Waiting here before
+	// Delete tests that contract: if the shim closes stdout promptly on
+	// process exit, outDone fires quickly; if the shim holds stdout
+	// open until Delete, this will time out.
 	select {
 	case <-outDone:
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for stdout drain")
+		t.Fatal("timed out waiting for stdout drain after process exit")
+	}
+
+	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec delete failed:", err)
 	}
 
 	if byteCount != int64(largeStdioPayloadSize) {
