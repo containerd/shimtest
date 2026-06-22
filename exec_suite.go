@@ -31,6 +31,7 @@ import (
 	"time"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
+	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
@@ -63,6 +64,7 @@ func (s *ExecSuite) Run(t *testing.T) {
 	t.Run("BindMountRead", s.testBindMountRead)
 	t.Run("FastExitOutput", s.testFastExitOutput)
 	t.Run("ExecOutputDrainAfterExit", s.testExecOutputDrainAfterExit)
+	t.Run("ExecDiscardIO", s.testExecDiscardIO)
 }
 
 // TestExec runs `echo execworks` inside a container and verifies the
@@ -1046,4 +1048,82 @@ func (s *ExecSuite) testExecOutputDrainAfterExit(t *testing.T) {
 		t.Fatalf("CRC mismatch: got %08x, want %08x (data corrupted)", gotCRC, wantCRC)
 	}
 	t.Logf("ok — %d bytes, CRC %08x", len(got), gotCRC)
+}
+
+// testExecDiscardIO execs a short-lived process with all stdio discarded
+// (empty Stdin/Stdout/Stderr), waits for it to exit, then Deletes the exec
+// while the container's init keeps running.
+func (s *ExecSuite) testExecDiscardIO(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "discard-io"
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/echo", "discardme"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("failed to marshal exec spec:", err)
+	}
+
+	// Deliberately leave Stdin/Stdout/Stderr unset: the exec has no I/O to
+	// forward, so the shim's forwardIO returns a nil shutdown func.
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec start failed:", err)
+	}
+
+	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID, ExecID: execID})
+	if err != nil {
+		t.Fatal("exec wait failed:", err)
+	}
+	t.Log("discard-io exec exit status:", waitResp.ExitStatus)
+
+	if _, err := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID}); err != nil {
+		t.Fatal("exec delete failed (shim likely crashed on a nil IO shutdown):", err)
+	}
+
+	stateResp, err := tc.State(ctx, &taskAPI.StateRequest{ID: containerID})
+	if err != nil {
+		t.Fatal("container State after exec delete failed (shim likely crashed):", err)
+	}
+	if stateResp.Status != tasktypes.Status_RUNNING {
+		t.Fatalf("container is %s after deleting a discarded-IO exec; want RUNNING (shim likely crashed)", stateResp.Status)
+	}
+
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	shutdownTask(ctx, tc, containerID)
 }
