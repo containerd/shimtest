@@ -65,6 +65,7 @@ func (s *ExecSuite) Run(t *testing.T) {
 	t.Run("FastExitOutput", s.testFastExitOutput)
 	t.Run("ExecOutputDrainAfterExit", s.testExecOutputDrainAfterExit)
 	t.Run("ExecDiscardIO", s.testExecDiscardIO)
+	t.Run("ExecCommandNotFound", s.testExecCommandNotFound)
 }
 
 // TestExec runs `echo execworks` inside a container and verifies the
@@ -1120,6 +1121,97 @@ func (s *ExecSuite) testExecDiscardIO(t *testing.T) {
 	}
 	if stateResp.Status != tasktypes.Status_RUNNING {
 		t.Fatalf("container is %s after deleting a discarded-IO exec; want RUNNING (shim likely crashed)", stateResp.Status)
+	}
+
+	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
+	tc.Wait(ctx, &taskAPI.WaitRequest{ID: containerID})
+	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID})
+	shutdownTask(ctx, tc, containerID)
+}
+
+// testExecCommandNotFound execs a binary that does not exist in the rootfs and
+// verifies two things: the exec start is reported as a failure, and —
+// critically — that deleting the failed exec returns promptly instead of
+// blocking on the 30 s ioShutdown fallback.
+//
+// A conforming shim closes the exec's stream connections on the start-failure
+// path, so the caller sees EOF immediately and Delete returns in milliseconds.
+func (s *ExecSuite) testExecCommandNotFound(t *testing.T) {
+	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
+	containerID := containerID(t)
+
+	createOCISpec(t, bundleDir, []string{"/bin/forever"}, s.cfg)
+
+	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
+	ns := uniqueTestNamespace(t, "exec")
+	ctx := namespaces.WithNamespace(t.Context(), ns)
+
+	params := startShim(t, shimBin, bundleDir, containerID, ns, s.cfg)
+	conn := connectShim(t, params.Address)
+	client := ttrpc.NewClient(conn)
+	defer client.Close()
+
+	tc := taskAPI.NewTTRPCTaskClient(client)
+
+	drainFifo(t, ctx, stdoutPath)
+	drainFifo(t, ctx, stderrPath)
+
+	if _, err := tc.Create(ctx, newCreateTaskRequest(t, containerID, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+		t.Fatal("create failed:", err)
+	}
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID}); err != nil {
+		t.Fatal("start failed:", err)
+	}
+
+	execID := "notfound-0"
+
+	execStdout, execStderr := createIOFifos(t, t.TempDir())
+	drainFifo(t, ctx, execStdout)
+	drainFifo(t, ctx, execStderr)
+
+	procSpec, err := typeurl.MarshalAnyToProto(&specs.Process{
+		Args: []string{"/bin/this-binary-does-not-exist"},
+		Cwd:  "/",
+		Env:  []string{"PATH=/bin:/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal("failed to marshal exec spec:", err)
+	}
+
+	// Exec (create) succeeds: the shim sets up IO forwarding and registers the
+	// exec. The failure happens at Start, when the runtime tries to exec the
+	// missing binary.
+	if _, err := tc.Exec(ctx, &taskAPI.ExecProcessRequest{
+		ID:     containerID,
+		ExecID: execID,
+		Spec:   procSpec,
+		Stdout: execStdout,
+		Stderr: execStderr,
+	}); err != nil {
+		t.Fatal("exec failed:", err)
+	}
+
+	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: containerID, ExecID: execID}); err == nil {
+		t.Fatal("expected exec start of a missing binary to fail, got nil error")
+	} else {
+		t.Log("exec start failed as expected:", err)
+	}
+
+	// The regression assertion: deleting the failed exec must not block on the
+	// 30 s ioShutdown fallback. 5 s is far above sub-second cleanup on a
+	// conforming shim and far below the 30 s fallback.
+	const maxDeleteDuration = 5 * time.Second
+	deleteStart := time.Now()
+	_, delErr := tc.Delete(ctx, &taskAPI.DeleteRequest{ID: containerID, ExecID: execID})
+	elapsed := time.Since(deleteStart)
+	if elapsed > maxDeleteDuration {
+		t.Fatalf("exec Delete blocked for %v (> %v): shim did not close the exec stream connections on the start-failure path — ioShutdown 30s fallback is masking the leak",
+			elapsed.Round(time.Millisecond), maxDeleteDuration)
+	}
+	// A Delete error is not the property under test (the exec already failed to
+	// start); only the absence of the 30 s stall is. Log it for context.
+	if delErr != nil {
+		t.Log("exec delete returned:", delErr)
 	}
 
 	tc.Kill(ctx, &taskAPI.KillRequest{ID: containerID, Signal: uint32(syscall.SIGKILL), All: true})
