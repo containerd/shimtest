@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782148939829,
+  "lastUpdate": 1782516998906,
   "repoUrl": "https://github.com/containerd/shimtest",
   "entries": {
     "runc rootless / containerd v2.3.0-beta.2": [
@@ -2512,6 +2512,126 @@ window.BENCHMARK_DATA = {
           {
             "name": "BenchmarkShim/runc-rootless/ReadBindMount - MB/s",
             "value": 2296.74,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "derek@mcg.dev",
+            "name": "Derek McGowan",
+            "username": "dmcgowan"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb4781e638a8cb0d971233a1b19803e33dc4cc75",
+          "message": "Merge pull request #4 from containerd/increase-stress-leak-threshold\n\nstress: raise Linux RSS threshold to 384 MiB; add ExecRSSGrowthOverride",
+          "timestamp": "2026-06-26T11:47:47-07:00",
+          "tree_id": "f32822f04c4dd87f8e99c1be0301cc8a4bc94fb1",
+          "url": "https://github.com/containerd/shimtest/commit/bb4781e638a8cb0d971233a1b19803e33dc4cc75"
+        },
+        "date": 1782516997859,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle",
+            "value": 51473139,
+            "unit": "ns/op\t        27.22 ms/create\t         5.169 ms/delete\t         6.275 ms/kill\t         6.551 ms/shim-start\t         5.521 ms/start\t         0.7384 ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ns/op",
+            "value": 51473139,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/create",
+            "value": 27.22,
+            "unit": "ms/create",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/delete",
+            "value": 5.169,
+            "unit": "ms/delete",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/kill",
+            "value": 6.275,
+            "unit": "ms/kill",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/shim-start",
+            "value": 6.551,
+            "unit": "ms/shim-start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/start",
+            "value": 5.521,
+            "unit": "ms/start",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Lifecycle - ms/wait",
+            "value": 0.7384,
+            "unit": "ms/wait",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Startup",
+            "value": 43343266,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/Exec",
+            "value": 22754102,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadLargeFile",
+            "value": 29314513,
+            "unit": "ns/op\t2289.27 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadLargeFile - ns/op",
+            "value": 29314513,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadLargeFile - MB/s",
+            "value": 2289.27,
+            "unit": "MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadBindMount",
+            "value": 29862111,
+            "unit": "ns/op\t2247.29 MB/s",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadBindMount - ns/op",
+            "value": 29862111,
+            "unit": "ns/op",
+            "extra": "5 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkShim/runc-rootless/ReadBindMount - MB/s",
+            "value": 2247.29,
             "unit": "MB/s",
             "extra": "5 times\n4 procs"
           }
