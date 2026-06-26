@@ -414,8 +414,8 @@ func dialPipeAsync(path string, timeout time.Duration) <-chan net.Conn {
 // the deferredPipeConnection pattern in containerd's shim_windows.go.
 type deferredPipeReader struct {
 	ch   <-chan net.Conn
-	conn net.Conn   // set on first Read after dial completes
-	once sync.Once  // ensures we receive from ch exactly once
+	conn net.Conn  // set on first Read after dial completes
+	once sync.Once // ensures we receive from ch exactly once
 	err  error
 }
 
