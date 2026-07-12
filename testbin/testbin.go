@@ -28,6 +28,7 @@
 package testbin
 
 import (
+	"bytes"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -39,7 +40,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Main is the entry point for the testbin multicall binary.  It dispatches
@@ -89,8 +92,16 @@ func Main() {
 		cmdHost(args)
 	case "looptest":
 		cmdLooptest(args)
+	case "echosrv":
+		cmdEchoServer(args)
 	case "tickexit":
 		cmdTickexit(args)
+	case "pidscan":
+		cmdPidscan(args)
+	case "shmwrite":
+		cmdShmWrite(args)
+	case "shmread":
+		cmdShmRead(args)
 	default:
 		fmt.Fprintf(os.Stderr, "testbin: unknown command: %s\n", cmd)
 		os.Exit(127)
@@ -477,12 +488,16 @@ func cmdBurstexit(args []string) {
 // that -v is honoured for listen mode only; standard nc is also verbose
 // about outgoing connections, which is not implemented here.
 //
-// In every stream mode nc terminates once *both* copy directions are done:
-// the peer has closed the connection *and* stdin has reached EOF. This
-// matches standard nc, which likewise keeps running after a peer close so
-// that a half-closed connection can still be written to. A caller driving nc
-// through a shim must therefore issue Task.CloseIO to signal stdin EOF;
-// closing its own write end of the stdin FIFO is not sufficient.
+// nc's stream modes are a symmetric bidirectional pipe that only terminates
+// once *both* copy directions are done: the peer has closed the connection
+// *and* stdin has reached EOF. This matches standard nc, which likewise
+// keeps running after a peer close so that a half-closed connection can
+// still be written to. A caller driving nc through a shim must therefore
+// issue Task.CloseIO to signal stdin EOF; closing its own write end of the
+// stdin FIFO is not sufficient. For "one container listens, another
+// connects" scenarios where neither end is a host-side Go program able to
+// explicitly Close() once done, see echosrv, a purpose-built one-shot
+// responder that always terminates on its own.
 //
 // UDP mode: one unconnected sendto (stdin→remote) then one recvfrom
 // (remote→stdout). The socket is unconnected (ListenPacket / WriteTo /
@@ -783,4 +798,183 @@ func cmdLooptest(args []string) {
 		fmt.Fprintf(os.Stderr, "looptest: server: %v\n", err)
 		os.Exit(1)
 	}
+}
+// cmdEchoServer listens on TCP port <port> (all interfaces), accepts exactly
+// one connection, reads exactly one chunk of data (up to 4096 bytes), writes
+// the same bytes back verbatim, closes the connection, and exits 0.
+//
+// Unlike "nc -l", which is a general-purpose bidirectional stream pipe (and
+// so never closes the connection on its own — the peer must close it),
+// echosrv is purpose-built as a one-shot round-trip responder: it always
+// terminates on its own once one exchange completes, which is what makes it
+// usable as a container's main process in a test that needs the container to
+// exit cleanly after proving connectivity (e.g. two containers exchanging
+// data over a shared network namespace, where neither side is a host-side Go
+// program that can explicitly Close() to signal completion).
+//
+// Usage: echosrv <port>
+func cmdEchoServer(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: echosrv <port>")
+		os.Exit(1)
+	}
+	// tcp4/0.0.0.0 explicitly, not "tcp"/":<port>" (which defaults to a
+	// dual-stack IPv6 socket on Linux): shimtest does not assume a shim's
+	// default container networking path supports IPv6, only IPv4.
+	ln, err := net.Listen("tcp4", "0.0.0.0:"+args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "echosrv: listen 0.0.0.0:%s: %v\n", args[1], err)
+		os.Exit(1)
+	}
+	conn, err := ln.Accept()
+	ln.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "echosrv: accept: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if n == 0 && err != nil {
+		fmt.Fprintf(os.Stderr, "echosrv: read: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := conn.Write(buf[:n]); err != nil {
+		fmt.Fprintf(os.Stderr, "echosrv: write: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// cmdPidscan lists every PID visible in this process's PID namespace
+// along with its cmdline, by scanning /proc. Used by shimtest to verify
+// PID namespace sharing across member containers: the test does not
+// know the PID number of the sentinel process it is looking for ahead
+// of time (only a unique marker string baked into that process's
+// argv), so it scans every visible PID's cmdline rather than checking
+// one specific PID.
+func cmdPidscan(_ []string) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pidscan: readdir /proc: %v\n", err)
+		os.Exit(1)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if _, err := strconv.Atoi(name); err != nil {
+			continue // not a PID directory
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", name, "cmdline"))
+		if err != nil {
+			// The process may have exited between the readdir and this
+			// read; that race is expected and not an error.
+			continue
+		}
+		cmdline := strings.ReplaceAll(strings.TrimRight(string(data), "\x00"), "\x00", " ")
+		fmt.Printf("%s %s\n", name, cmdline)
+	}
+}
+
+const (
+	shmSize = 4096
+	// ipcCreat is IPC_CREAT, from linux/ipc.h. The stdlib syscall
+	// package exposes SysV shm's syscall numbers (SYS_SHMGET etc.) but
+	// not its flag constants, so this is hardcoded.
+	ipcCreat = 0o1000
+)
+
+// cmdShmWrite creates (or reuses) a SysV shared memory segment
+// identified by a fixed numeric key and writes a marker string into it,
+// then detaches — but does not remove — the segment, leaving it behind
+// for a later shmread call to find.
+//
+// Used by shimtest to verify IPC namespace sharing: SysV IPC objects
+// are keyed and visible only within the creating process's IPC
+// namespace, independent of mount namespace or any bind-mounted
+// /dev/shm, so a successful cross-container shmwrite/shmread round
+// trip through the same key is conclusive proof of a shared IPC
+// namespace (and not, for instance, an artifact of a shared /dev/shm
+// bind mount).
+//
+// Usage: shmwrite <key> <marker>
+func cmdShmWrite(args []string) {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: shmwrite <key> <marker>")
+		os.Exit(1)
+	}
+	key, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shmwrite: invalid key %q: %v\n", args[1], err)
+		os.Exit(1)
+	}
+	marker := args[2]
+	if len(marker) >= shmSize {
+		fmt.Fprintln(os.Stderr, "shmwrite: marker too large")
+		os.Exit(1)
+	}
+
+	shmid, _, errno := syscall.Syscall(syscall.SYS_SHMGET, uintptr(key), shmSize, ipcCreat|0600)
+	if errno != 0 {
+		fmt.Fprintf(os.Stderr, "shmwrite: shmget: %v\n", errno)
+		os.Exit(1)
+	}
+	addr, _, errno := syscall.Syscall(syscall.SYS_SHMAT, shmid, 0, 0)
+	if errno != 0 {
+		fmt.Fprintf(os.Stderr, "shmwrite: shmat: %v\n", errno)
+		os.Exit(1)
+	}
+	// addr is a raw address returned by the shmat(2) syscall, not derived
+	// from a Go pointer, so it doesn't fit vet's recognized safe-conversion
+	// patterns even though the conversion itself is valid here.
+	buf := (*[shmSize]byte)(unsafe.Pointer(addr)) //nolint:govet
+	n := copy(buf[:], marker)
+	buf[n] = 0
+	syscall.Syscall(syscall.SYS_SHMDT, addr, 0, 0) //nolint:errcheck
+
+	fmt.Println("shmwrite: ok")
+}
+
+// cmdShmRead attaches to an existing SysV shared memory segment
+// identified by a fixed numeric key (created by a prior shmwrite call,
+// possibly in a different container) and prints the marker string
+// found in it.
+//
+// It deliberately omits IPC_CREAT: if the segment does not already
+// exist in this process's IPC namespace, that is exactly the "not
+// shared" case and must be reported as a failure, rather than silently
+// creating a fresh, empty segment that would make a broken test look
+// like it passed.
+//
+// Usage: shmread <key>
+func cmdShmRead(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: shmread <key>")
+		os.Exit(1)
+	}
+	key, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shmread: invalid key %q: %v\n", args[1], err)
+		os.Exit(1)
+	}
+
+	shmid, _, errno := syscall.Syscall(syscall.SYS_SHMGET, uintptr(key), shmSize, 0600)
+	if errno != 0 {
+		fmt.Println("shmread: NOTFOUND")
+		os.Exit(1)
+	}
+	addr, _, errno := syscall.Syscall(syscall.SYS_SHMAT, shmid, 0, 0)
+	if errno != 0 {
+		fmt.Fprintf(os.Stderr, "shmread: shmat: %v\n", errno)
+		os.Exit(1)
+	}
+	// See the matching comment in cmdShmWrite: addr comes from shmat(2),
+	// not from a Go pointer, so vet can't recognize this as a safe
+	// conversion even though it is one.
+	buf := (*[shmSize]byte)(unsafe.Pointer(addr)) //nolint:govet
+	end := bytes.IndexByte(buf[:], 0)
+	if end < 0 {
+		end = shmSize
+	}
+	fmt.Println(string(buf[:end]))
+	syscall.Syscall(syscall.SYS_SHMDT, addr, 0, 0) //nolint:errcheck
 }

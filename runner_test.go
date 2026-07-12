@@ -60,8 +60,12 @@ func TestShim(t *testing.T) {
 			if !featureSkipped("net") {
 				shimtest.NewNetworkSuite(c).Run(t)
 			}
+			if !featureSkipped("sandbox") {
+				shimtest.NewSandboxSuite(c).Run(t)
+			}
 			t.Run("Stress", shimtest.NewStressSuite(c, shimtest.StressOptions{
 				Transfer: !featureSkipped("transfer"),
+				Sandbox:  !featureSkipped("sandbox"),
 			}).Run)
 		})
 	}
@@ -91,6 +95,9 @@ func BenchmarkShim(b *testing.B) {
 			}
 			if !featureSkipped("layers") {
 				shimtest.NewLayersSuite(c).Bench(b)
+			}
+			if !featureSkipped("sandbox") {
+				shimtest.NewSandboxSuite(c).Bench(b)
 			}
 		})
 	}
