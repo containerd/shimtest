@@ -79,7 +79,7 @@ func (s *RunSuite) testLifecycle(t *testing.T) {
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
@@ -173,7 +173,7 @@ func (s *RunSuite) testInitExitCodes(t *testing.T) {
 			client := ttrpc.NewClient(conn)
 			defer client.Close()
 
-			tc := taskAPI.NewTTRPCTaskClient(client)
+			tc := newTaskClient(client, params.Version)
 
 			drainFifo(t, ctx, stdoutPath)
 			drainFifo(t, ctx, stderrPath)
@@ -217,7 +217,7 @@ func (s *RunSuite) testOutputThenExit(t *testing.T) {
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
@@ -298,7 +298,7 @@ func (s *RunSuite) testEvents(t *testing.T) {
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	drainFifo(t, ctx, stdoutPath)
 	drainFifo(t, ctx, stderrPath)
@@ -397,7 +397,7 @@ func (s *RunSuite) testFastExitInit(t *testing.T) {
 	client := ttrpc.NewClient(conn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
