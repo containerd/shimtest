@@ -25,6 +25,7 @@
 package shimtest
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -103,4 +104,76 @@ func (s *SandboxSuite) testContainerTrafficScopedToNetworkSandbox(t *testing.T) 
 	}
 
 	t.Log("container traffic is scoped to the provided network sandbox")
+}
+
+// testInboundToNetnsScopedListener verifies the inbound (listen) side of the
+// network-sandbox contract: a member container that binds a TCP listener must
+// be reachable by a caller connecting from within the same network sandbox.
+//
+// The API contract: when a sandbox is given a non-empty netns_path in
+// CreateSandboxRequest, a member container's inbound TCP listener must be
+// accessible from within that network sandbox — not only from the root
+// namespace. This is the mirror of testContainerTrafficScopedToNetworkSandbox:
+// where that test verifies outbound traffic stays inside the sandbox, this
+// test verifies that inbound connections from inside the sandbox reach the
+// container listener.
+//
+// Test topology: the same veth-pair-inside-a-real-netns setup from
+// testContainerTrafficScopedToNetworkSandbox, except the roles are reversed.
+// A member container runs echosrv (which prints its bound port to stdout then
+// accepts one connection and echoes). Once the port is known, the test enters
+// the sandbox namespace on a locked OS thread and dials the container from
+// inside it. Since the veth addresses are unreachable from outside the
+// namespace, a successful round trip proves the listener is inside the sandbox.
+//
+// Requires root (CAP_SYS_ADMIN) to create a network namespace and attach
+// network interfaces; skipped otherwise.
+func (s *SandboxSuite) testInboundToNetnsScopedListener(t *testing.T) {
+	netns := createRealNetworkSandbox(t)
+	vethAddr := netns.attachVeth(t)
+
+	// Sanity check: the veth address is unreachable from our namespace.
+	probeUnreachableFromCurrentNamespace(t, net.JoinHostPort(vethAddr, "1"))
+
+	sandboxID := containerID(t)
+	env := startSandboxShimWithNetworkSandbox(t, s.cfg, sandboxID, netns.path)
+
+	// Start echosrv 0 (ephemeral port). echosrv prints the bound port to
+	// stdout before accepting, so readContainerOutput will capture it.
+	listenerCID := createContainerInSandbox(t, env, []string{"/bin/echosrv", "0"})
+
+	// Wait for echosrv to print the port to stdout. The port appears as the
+	// first (and only pre-accept) line; give it 15 s which is generous for
+	// any VM start + listen latency.
+	boundPort := waitForContainerPort(t, env, listenerCID, 15*time.Second)
+	t.Logf("container echosrv bound on port %s", boundPort)
+
+	// The container is inside the sandbox netns; its listener is reachable
+	// at the veth address from inside that namespace. Dial from inside it.
+	endpoint := net.JoinHostPort(vethAddr, boundPort)
+	const token = "netns-inbound-ok"
+	done := dialInNetnsRoundTrip(t, netns.path, endpoint, token)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("dial from inside sandbox namespace to container listener failed: %v\n"+
+				"(the shim must make the container's listener reachable from within "+
+				"the provided network sandbox)", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for in-netns dial to container listener to complete")
+	}
+
+	// echosrv exits after one exchange; wait for it.
+	waitResp, err := env.tc.Wait(env.ctx, &taskAPI.WaitRequest{ID: listenerCID})
+	if err != nil {
+		t.Fatalf("Task.Wait listener: %v", err)
+	}
+	if waitResp.GetExitStatus() != 0 {
+		t.Fatalf("listener container exit status: got %d, want 0", waitResp.GetExitStatus())
+	}
+	env.tc.Delete(env.ctx, &taskAPI.DeleteRequest{ID: listenerCID}) //nolint:errcheck
+
+	t.Log("inbound connection from inside network sandbox to container listener: ok")
 }

@@ -42,15 +42,15 @@ func (s *SandboxSuite) testMemberContainersShareNetwork(t *testing.T) {
 	sandboxID := containerID(t)
 	env := startSandboxShim(t, s.cfg, sandboxID)
 
-	const port = "9192"
+	// Use port 0 so the OS picks an ephemeral port, avoiding collisions
+	// when tests run concurrently. echosrv prints the actual bound port to
+	// stdout before accepting; waitForContainerPort reads it synchronously,
+	// replacing the old time.Sleep readiness guard with a real signal.
+	listenerCID := createContainerInSandbox(t, env, []string{"/bin/echosrv", "0"})
 
-	listenerCID := createContainerInSandbox(t, env, []string{"/bin/echosrv", port})
-
-	// Give the listener container a moment to actually bind and start
-	// accepting before the client attempts to connect. There is no
-	// synchronous "ready" signal available across two containers created
-	// independently via the Task API.
-	time.Sleep(200 * time.Millisecond)
+	// Block until echosrv has bound and printed its port — no sleep needed.
+	port := waitForContainerPort(t, env, listenerCID, 30*time.Second)
+	t.Logf("listener container bound on port %s", port)
 
 	const token = "shared-netns-ok"
 	clientCID := createContainerInSandbox(t, env, []string{"/bin/nc", "127.0.0.1", port}, withSandboxCtrStdin())

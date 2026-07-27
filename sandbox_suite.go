@@ -105,6 +105,7 @@ func (s *SandboxSuite) Run(t *testing.T) {
 	t.Run("NetworkSandboxPathInStatus", s.testNetworkSandboxPathInStatus)
 	t.Run("ContainerOutboundTCP", s.testContainerOutboundTCP)
 	t.Run("ContainerTrafficScopedToNetworkSandbox", s.testContainerTrafficScopedToNetworkSandbox)
+	t.Run("InboundToNetnsScopedListener", s.testInboundToNetnsScopedListener)
 	t.Run("MemberContainersShareNetwork", s.testMemberContainersShareNetwork)
 	t.Run("MemberContainerHostVolume", s.testMemberContainerHostVolume)
 	t.Run("MemberContainersSharePID", s.testMemberContainersSharePID)

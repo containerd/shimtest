@@ -799,6 +799,7 @@ func cmdLooptest(args []string) {
 		os.Exit(1)
 	}
 }
+
 // cmdEchoServer listens on TCP port <port> (all interfaces), accepts exactly
 // one connection, reads exactly one chunk of data (up to 4096 bytes), writes
 // the same bytes back verbatim, closes the connection, and exits 0.
@@ -826,6 +827,14 @@ func cmdEchoServer(args []string) {
 		fmt.Fprintf(os.Stderr, "echosrv: listen 0.0.0.0:%s: %v\n", args[1], err)
 		os.Exit(1)
 	}
+	// Always print the actual bound port before accepting, so the test can
+	// discover it even when port 0 (ephemeral) was requested.
+	_, boundPort, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "echosrv: splithost: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(boundPort)
 	conn, err := ln.Accept()
 	ln.Close()
 	if err != nil {

@@ -213,3 +213,64 @@ func listenAndEchoOnceInNetns(tb testing.TB, nsPath, addr string) <-chan error {
 	}
 	return result
 }
+
+// dialInNetnsRoundTrip is the complement of listenAndEchoOnceInNetns: it
+// enters the network namespace at nsPath on a dedicated, locked OS thread,
+// dials a TCP connection to addr, sends token, reads the echo, and
+// reports the result on the returned channel.
+//
+// Combined with a guest container running echosrv (which binds 0.0.0.0 and
+// has its traffic scoped to the same namespace by the shim), a successful
+// round trip is only possible if the container's listener is genuinely
+// reachable from within that namespace — proving the shim honours the
+// inbound side of the network-sandbox contract, not just the outbound.
+func dialInNetnsRoundTrip(tb testing.TB, nsPath, addr, token string) <-chan error {
+	tb.Helper()
+
+	result := make(chan error, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		// Intentionally never unlocked: Go retires this OS thread when the
+		// goroutine exits (Go 1.10+), so the namespace change does not leak
+		// into the shared thread pool.
+
+		f, err := os.Open(nsPath)
+		if err != nil {
+			result <- fmt.Errorf("open netns %q: %w", nsPath, err)
+			return
+		}
+		defer f.Close()
+		if err := unix.Setns(int(f.Fd()), unix.CLONE_NEWNET); err != nil {
+			result <- fmt.Errorf("setns %q: %w", nsPath, err)
+			return
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
+		if err != nil {
+			result <- fmt.Errorf("dial %s in netns: %w", addr, err)
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		if _, err := conn.Write([]byte(token)); err != nil {
+			result <- fmt.Errorf("write: %w", err)
+			return
+		}
+		buf := make([]byte, 256)
+		n, rerr := conn.Read(buf)
+		if n == 0 && rerr != nil {
+			result <- fmt.Errorf("read: %w", rerr)
+			return
+		}
+		got := string(buf[:n])
+		if got != token {
+			result <- fmt.Errorf("echo mismatch: got %q, want %q", got, token)
+			return
+		}
+		result <- nil
+	}()
+
+	return result
+}

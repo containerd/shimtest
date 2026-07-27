@@ -500,6 +500,41 @@ func readSandboxOutput(tb testing.TB, ctx context.Context, stdoutPath, want stri
 	}
 }
 
+// waitForContainerPort waits for a container that prints its bound port as the
+// first line of stdout (e.g. echosrv or nc -l with port 0) to become ready,
+// and returns the port string. It polls the captured stdout buffer until a
+// newline-terminated first line appears or timeout elapses (fatal).
+//
+// This allows tests to synchronise with a container listener without a fixed
+// sleep: once the port line has been emitted the container is ready to accept
+// connections.
+func waitForContainerPort(tb testing.TB, env *sandboxEnv, cid string, timeout time.Duration) string {
+	tb.Helper()
+	env.mu.Lock()
+	co := env.stdoutBufs[cid]
+	env.mu.Unlock()
+	if co == nil {
+		tb.Fatalf("waitForContainerPort: no captured stdout for container %s", cid)
+	}
+	deadline := time.After(timeout)
+	for {
+		co.mu.Lock()
+		out := co.buf.String()
+		co.mu.Unlock()
+		if idx := strings.Index(out, "\n"); idx >= 0 {
+			return strings.TrimSpace(out[:idx])
+		}
+		select {
+		case <-deadline:
+			co.mu.Lock()
+			final := co.buf.String()
+			co.mu.Unlock()
+			tb.Fatalf("timed out after %v waiting for port line from container %s; got: %q", timeout, cid, final)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // sandboxShimPID resolves the shim OS PID via the Task.Connect RPC
 // after the first member container exists.  Returns 0 if unavailable.
 func sandboxShimPID(env *sandboxEnv, memberCID string) int {
