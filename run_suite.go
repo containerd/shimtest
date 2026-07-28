@@ -31,6 +31,8 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/ttrpc"
 	typeurl "github.com/containerd/typeurl/v2"
 )
@@ -133,7 +135,13 @@ func (s *RunSuite) testLifecycle(t *testing.T) {
 		Signal: uint32(syscall.SIGKILL),
 		All:    true,
 	}); err != nil {
-		t.Fatal("failed to kill task:", err)
+		// The process may have exited naturally before Kill is called.
+		// NotFound means the process is already in a terminal state,
+		// which is fine - proceed to Wait and Delete.
+		if !errdefs.IsNotFound(errgrpc.ToNative(err)) {
+			t.Fatal("failed to kill task:", err)
+		}
+		t.Log("task already finished before kill (benign race):", err)
 	}
 
 	t.Log("waiting for task exit")
