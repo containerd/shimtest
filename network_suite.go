@@ -137,6 +137,17 @@ func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 	stdoutDone := drainFifoIntoDone(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
 	drainFifo(t, ctx, stderrPath)
 
+	// Open the stdin pipe writer before Create. On Windows the shim dials
+	// the stdin named pipe synchronously during the Create RPC, so the
+	// server-side listener must already be accepting before that call is
+	// issued — exactly the same ordering constraint as with exec stdin in
+	// testStdinDetachReattach. openPipeWriter starts the Accept in a
+	// background goroutine so the call returns immediately.
+	stdinFifo, err := openPipeWriter(ctx, stdinPath)
+	if err != nil {
+		t.Fatalf("open stdin fifo: %v", err)
+	}
+
 	if _, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
@@ -145,14 +156,19 @@ func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 	}
 
 	// Write the token to the container's stdin so nc sends it to the host.
-	stdinFifo, err := openPipeWriter(ctx, stdinPath)
-	if err != nil {
-		t.Fatalf("open stdin fifo: %v", err)
-	}
 	if _, err := fmt.Fprintf(stdinFifo, "%s\n", token); err != nil {
 		t.Fatalf("write token to stdin: %v", err)
 	}
 	stdinFifo.Close()
+
+	// Signal EOF to nc via the CloseIO RPC. Closing the test's own FIFO
+	// write end alone is not sufficient: the shim holds its own write-end
+	// reference on the stdin FIFO and only releases it upon CloseIO,
+	// exactly as documented for exec stdin in exec_suite.go. Without this
+	// call the container's init process would never observe stdin EOF.
+	if _, err := tc.CloseIO(ctx, &taskAPI.CloseIORequest{ID: cid, Stdin: true}); err != nil {
+		t.Fatal("close stdin failed:", err)
+	}
 
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	if err != nil {
@@ -251,6 +267,14 @@ func (s *NetworkSuite) testOutboundUDP(t *testing.T) {
 	stdoutDone := drainFifoIntoDone(t, ctx, stdoutPath, &stdoutBuf, &stdoutMu)
 	drainFifo(t, ctx, stderrPath)
 
+	// Open the stdin pipe writer before Create for the same reason as
+	// testOutboundTCP: the shim dials stdin synchronously during Create on
+	// Windows, so the listener must be accepting before that RPC is issued.
+	stdinFifo, err := openPipeWriter(ctx, stdinPath)
+	if err != nil {
+		t.Fatalf("open stdin fifo: %v", err)
+	}
+
 	if _, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts)); err != nil {
 		t.Fatal("create failed:", err)
 	}
@@ -259,14 +283,16 @@ func (s *NetworkSuite) testOutboundUDP(t *testing.T) {
 	}
 
 	// Write the token to stdin and close so nc reads EOF and sends one datagram.
-	stdinFifo, err := openPipeWriter(ctx, stdinPath)
-	if err != nil {
-		t.Fatalf("open stdin fifo: %v", err)
-	}
 	if _, err := fmt.Fprint(stdinFifo, token); err != nil {
 		t.Fatalf("write token to stdin: %v", err)
 	}
 	stdinFifo.Close()
+
+	// Signal EOF to nc via the CloseIO RPC; see testOutboundTCP for why
+	// closing the test's own FIFO write end alone is not sufficient.
+	if _, err := tc.CloseIO(ctx, &taskAPI.CloseIORequest{ID: cid, Stdin: true}); err != nil {
+		t.Fatal("close stdin failed:", err)
+	}
 
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	if err != nil {
