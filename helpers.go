@@ -37,7 +37,6 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/ttrpc"
 
-	runtimev2 "github.com/containerd/containerd/v2/core/runtime/v2"
 	"github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -540,12 +539,7 @@ func deleteShim(tb testing.TB, shimBin, bundleDir, id, ns string, cfg Config) {
 // (core/runtime/v2 NewTaskClient): a version 3 shim is dialed on
 // containerd.task.v3.Task, a version 2 shim through the v2 bridge.
 func newTaskClient(client *ttrpc.Client, version int) taskAPI.TTRPCTaskService {
-	tc, err := runtimev2.NewTaskClient(client, version)
-	if err != nil {
-		// Unreachable: startShim validated the version at bootstrap.
-		panic(err)
-	}
-	return tc
+	return taskClientForVersion(client, version)
 }
 
 // shimPidViaConnect dials the shim's TTRPC address and asks for its
