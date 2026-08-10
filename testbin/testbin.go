@@ -102,6 +102,10 @@ func Main() {
 		cmdShmWrite(args)
 	case "shmread":
 		cmdShmRead(args)
+	case "shmmapwrite":
+		cmdShmMapWrite(args)
+	case "shmmapread":
+		cmdShmMapRead(args)
 	default:
 		fmt.Fprintf(os.Stderr, "testbin: unknown command: %s\n", cmd)
 		os.Exit(127)
@@ -986,4 +990,107 @@ func cmdShmRead(args []string) {
 	}
 	fmt.Println(string(buf[:end]))
 	syscall.Syscall(syscall.SYS_SHMDT, addr, 0, 0) //nolint:errcheck
+}
+
+// shmMapSize is the file/mapping size used by cmdShmMapWrite and
+// cmdShmMapRead. Independent of shmSize (the SysV segment size above):
+// these test a different sharing mechanism and there's no reason to couple
+// their sizes.
+const shmMapSize = 4096
+
+// cmdShmMapWrite creates (or truncates) the file at path to shmMapSize and
+// writes marker into it through an mmap(MAP_SHARED) mapping — not via a
+// write(2) call — then unmaps and exits, leaving the file (and, since the
+// mapping is MAP_SHARED, its written contents) behind for a later
+// shmmapread call to find.
+//
+// This, together with shmmapread, is a POSIX-shared-memory-style access
+// pattern layered on an ordinary file (as, for example, glibc's
+// shm_open()+mmap() is): the file's path is what a caller controls to
+// target /dev/shm specifically or any other shared location, but the
+// read/write path deliberately goes through the mapping, not the file
+// descriptor, since what's under test is whether two independent
+// mmap(MAP_SHARED) calls on the same underlying file — potentially made by
+// processes in different containers, each reaching the file through its
+// own bind mount of a shared directory — actually share memory, rather
+// than each seeing an independent, disconnected copy.
+//
+// Usage: shmmapwrite <path> <marker>
+func cmdShmMapWrite(args []string) {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: shmmapwrite <path> <marker>")
+		os.Exit(1)
+	}
+	path := args[1]
+	marker := args[2]
+	if len(marker) >= shmMapSize {
+		fmt.Println("shmmapwrite: marker too large")
+		os.Exit(1)
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		fmt.Printf("shmmapwrite: open: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	if err := f.Truncate(shmMapSize); err != nil {
+		fmt.Printf("shmmapwrite: truncate: %v\n", err)
+		os.Exit(1)
+	}
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, shmMapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		fmt.Printf("shmmapwrite: mmap: %v\n", err)
+		os.Exit(1)
+	}
+
+	n := copy(data, marker)
+	data[n] = 0
+
+	if err := syscall.Munmap(data); err != nil {
+		fmt.Printf("shmmapwrite: munmap: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("shmmapwrite: ok")
+}
+
+// cmdShmMapRead opens the file at path (created by a prior shmmapwrite
+// call, possibly in a different container) and reads the marker string
+// back through an mmap(MAP_SHARED) mapping — not via a read(2) call. See
+// cmdShmMapWrite for why the access pattern matters.
+//
+// It deliberately does not create path if missing: a missing file is
+// exactly the "not shared" case and must be reported as a failure, rather
+// than silently creating a fresh, empty one that would make a broken test
+// look like it passed.
+//
+// Usage: shmmapread <path>
+func cmdShmMapRead(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: shmmapread <path>")
+		os.Exit(1)
+	}
+	path := args[1]
+
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		fmt.Println("shmmapread: NOTFOUND")
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, shmMapSize, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shmmapread: mmap: %v\n", err)
+		os.Exit(1)
+	}
+	defer syscall.Munmap(data) //nolint:errcheck
+
+	end := bytes.IndexByte(data, 0)
+	if end < 0 {
+		end = shmMapSize
+	}
+	fmt.Println(string(data[:end]))
 }

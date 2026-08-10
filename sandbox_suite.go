@@ -109,7 +109,10 @@ func (s *SandboxSuite) Run(t *testing.T) {
 	t.Run("MemberContainersShareNetwork", s.testMemberContainersShareNetwork)
 	t.Run("MemberContainerHostVolume", s.testMemberContainerHostVolume)
 	t.Run("MemberContainersSharePID", s.testMemberContainersSharePID)
+	t.Run("MemberContainersSharePIDKillScopedToOwnContainer", s.testMemberContainersSharePIDKillScopedToOwnContainer)
 	t.Run("MemberContainersShareIPC", s.testMemberContainersShareIPC)
+	t.Run("MemberContainersShareDevShm", s.testMemberContainersShareDevShm)
+	t.Run("MemberContainersDevShmNotSharedWithoutIPC", s.testMemberContainersDevShmNotSharedWithoutIPC)
 }
 
 // testLifecycle drives the sandbox through the full lifecycle:

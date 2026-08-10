@@ -85,3 +85,74 @@ func (s *SandboxSuite) testMemberContainersSharePID(t *testing.T) {
 
 	t.Log("member containers share a PID namespace: scanner observed the sentinel process's argv")
 }
+
+// testMemberContainersSharePIDKillScopedToOwnContainer verifies the
+// converse safety property to testMemberContainersSharePID: sharing a PID
+// namespace makes a peer's processes *visible*, but Task.Kill and
+// Task.Pids remain scoped to the container named in the request and never
+// affect or report a peer's processes, even though both containers' PIDs
+// live in the same namespace and are visible to each other via /proc.
+//
+// The API contract: Task.Kill and Task.Pids identify processes by
+// container ID (and, for Kill, ExecID) — never by a raw PID — so a shim
+// must resolve a request against that specific container's own tracked
+// process(es), not by number within whatever PID namespace the container
+// happens to be in. A caller has no way to name a PID at all through this
+// API, so this test's job is to confirm a shim doesn't reintroduce that
+// possibility through some other means (e.g. resolving Kill by scanning a
+// shared namespace for a matching argv or similar).
+func (s *SandboxSuite) testMemberContainersSharePIDKillScopedToOwnContainer(t *testing.T) {
+	sandboxID := containerID(t)
+	env := startSandboxShim(t, s.cfg, sandboxID)
+
+	const (
+		victimMarker = "pid-kill-scope-victim"
+		peerMarker   = "pid-kill-scope-peer"
+	)
+
+	victimCID := createContainerInSandbox(t, env, []string{"/bin/forever", victimMarker},
+		withSandboxCtrNamespace(specs.PIDNamespace, "/proc/1/ns/pid"))
+	peerCID := createContainerInSandbox(t, env, []string{"/bin/forever", peerMarker},
+		withSandboxCtrNamespace(specs.PIDNamespace, "/proc/1/ns/pid"))
+
+	// Give both a moment to actually start (see testMemberContainersSharePID).
+	time.Sleep(200 * time.Millisecond)
+
+	// Confirm sharing actually took effect before testing scoping: a
+	// scanner that can't see the peer at all would make the rest of this
+	// test meaningless (scoping would trivially "work" for the wrong
+	// reason).
+	scannerCID := createContainerInSandbox(t, env, []string{"/bin/pidscan"},
+		withSandboxCtrNamespace(specs.PIDNamespace, "/proc/1/ns/pid"))
+	out := readContainerOutput(t, env, scannerCID, peerMarker, 30*time.Second)
+	if !strings.Contains(out, peerMarker) {
+		t.Fatalf("pidscan output did not contain peer marker %q: %q (sharing did not take effect)", peerMarker, out)
+	}
+	env.tc.Wait(env.ctx, &taskAPI.WaitRequest{ID: scannerCID})     //nolint:errcheck
+	env.tc.Delete(env.ctx, &taskAPI.DeleteRequest{ID: scannerCID}) //nolint:errcheck
+
+	// Kill the victim with All: true -- the broadest kill request the API
+	// allows -- and confirm the peer, sharing the same PID namespace, is
+	// unaffected.
+	if _, err := env.tc.Kill(env.ctx, &taskAPI.KillRequest{ID: victimCID, Signal: 9, All: true}); err != nil {
+		t.Fatalf("Task.Kill victim: %v", err)
+	}
+	env.tc.Wait(env.ctx, &taskAPI.WaitRequest{ID: victimCID})     //nolint:errcheck
+	env.tc.Delete(env.ctx, &taskAPI.DeleteRequest{ID: victimCID}) //nolint:errcheck
+
+	peerPids, err := env.tc.Pids(env.ctx, &taskAPI.PidsRequest{ID: peerCID})
+	if err != nil {
+		t.Fatalf("Task.Pids peer: %v", err)
+	}
+	if len(peerPids.GetProcesses()) == 0 {
+		t.Fatal("peer container reports no processes after killing the victim; it should be unaffected")
+	}
+
+	if _, err := env.tc.Kill(env.ctx, &taskAPI.KillRequest{ID: peerCID, Signal: 9, All: true}); err != nil {
+		t.Fatalf("Task.Kill peer: %v", err)
+	}
+	env.tc.Wait(env.ctx, &taskAPI.WaitRequest{ID: peerCID})     //nolint:errcheck
+	env.tc.Delete(env.ctx, &taskAPI.DeleteRequest{ID: peerCID}) //nolint:errcheck
+
+	t.Log("Task.Kill and Task.Pids stayed scoped to their own container despite a shared PID namespace")
+}
