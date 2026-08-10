@@ -288,6 +288,16 @@ func withSandboxCtrNamespace(nsType specs.LinuxNamespaceType, path string) func(
 	}
 }
 
+// withSandboxCtrOCIOpts appends arbitrary low-level OCI spec opts (e.g.
+// withMemoryLimit, withCapabilities) to a member container's spec. Use
+// this for anything createContainerInSandbox doesn't have a
+// higher-level opt for.
+func withSandboxCtrOCIOpts(opts ...func(*specs.Spec)) func(*sandboxCtrSpec) {
+	return func(o *sandboxCtrSpec) {
+		o.ociOpts = append(o.ociOpts, opts...)
+	}
+}
+
 // createSandboxContainerFast creates and starts a member container using
 // pre-built rootfs images.  It is the stress-loop counterpart of
 // createContainerInSandbox: it avoids calling writeRootfsErofs /
