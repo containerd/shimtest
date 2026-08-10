@@ -538,7 +538,10 @@ func waitForContainerPort(tb testing.TB, env *sandboxEnv, cid string, timeout ti
 // sandboxShimPID resolves the shim OS PID via the Task.Connect RPC
 // after the first member container exists.  Returns 0 if unavailable.
 func sandboxShimPID(env *sandboxEnv, memberCID string) int {
-	pid, err := shimPidViaConnect(env.address, memberCID, 2*time.Second)
+	// The sandbox API requires bootstrap version >= 3 (enforced in
+	// startSandboxShimInner), so the shim is always dialed as a v3 task
+	// service here.
+	pid, err := shimPidViaConnect(env.address, memberCID, 3, 2*time.Second)
 	if err != nil {
 		return 0
 	}
