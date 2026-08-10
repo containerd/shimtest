@@ -106,6 +106,8 @@ func Main() {
 		cmdShmMapWrite(args)
 	case "shmmapread":
 		cmdShmMapRead(args)
+	case "hostname":
+		cmdHostname(args)
 	default:
 		fmt.Fprintf(os.Stderr, "testbin: unknown command: %s\n", cmd)
 		os.Exit(127)
@@ -1093,4 +1095,43 @@ func cmdShmMapRead(args []string) {
 		end = shmMapSize
 	}
 	fmt.Println(string(data[:end]))
+}
+
+// cmdHostname mirrors the standard "hostname" utility's CLI: with no
+// argument it prints the calling process's UTS namespace hostname as
+// reported by the kernel (via gethostname(2), not /etc/hostname or an
+// env var); with one argument it sets the hostname (via sethostname(2))
+// and, matching the standard utility, exits immediately and silently on
+// success rather than staying running or printing anything.
+//
+// sethostname(2) requires CAP_SYS_ADMIN in the user namespace that owns
+// the target UTS namespace; the container's OCI spec must request that
+// capability explicitly (shimtest's base spec grants none) for a set to
+// succeed at all. On failure (of either form) a "hostname: ..." message
+// is printed to stderr and the process exits non-zero, matching the
+// standard utility's error convention.
+//
+// Because this command exits immediately after a successful set rather
+// than holding the UTS namespace open itself, a caller that verifies a
+// hostname change is later visible to a different process is also
+// proving that the namespace — and its hostname — outlives the process
+// that set it, not merely that a still-running setter's own namespace
+// is visible.
+//
+// Usage: hostname [name]
+func cmdHostname(args []string) {
+	if len(args) < 2 {
+		name, err := os.Hostname()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hostname: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(name)
+		return
+	}
+
+	if err := syscall.Sethostname([]byte(args[1])); err != nil {
+		fmt.Fprintf(os.Stderr, "hostname: %v\n", err)
+		os.Exit(1)
+	}
 }

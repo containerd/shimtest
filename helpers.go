@@ -265,6 +265,35 @@ func withNewNetworkNamespace() func(*specs.Spec) {
 	}
 }
 
+// withCapabilities returns a CreateOCISpec opt that grants the given
+// capabilities (e.g. "CAP_SYS_ADMIN") in the container's Bounding,
+// Effective, and Permitted sets, in addition to whatever the spec
+// already carries.
+//
+// The base spec createOCISpec builds has no Capabilities section at
+// all, which every runtime this repo has been tested against
+// (confirmed empirically with runc) treats as granting the container
+// *no* capabilities whatsoever — not even the small default set a
+// container engine like Docker or containerd/CRI would normally add —
+// regardless of the privilege level of the process driving the test
+// suite on the host. A test that needs a capability inside the
+// container must therefore request it explicitly here, on the
+// container's own spec; this is a property of the requested container,
+// not of the host, and needs no host-level privilege to ask for.
+// Whether the shim actually honors the request is exactly what a test
+// using this opt is checking.
+func withCapabilities(caps ...string) func(*specs.Spec) {
+	return func(s *specs.Spec) {
+		if s.Process.Capabilities == nil {
+			s.Process.Capabilities = &specs.LinuxCapabilities{}
+		}
+		c := s.Process.Capabilities
+		c.Bounding = append(c.Bounding, caps...)
+		c.Effective = append(c.Effective, caps...)
+		c.Permitted = append(c.Permitted, caps...)
+	}
+}
+
 // shimSetup resolves the shim binary, creates a bundle directory, and
 // builds rootfs mounts from the embedded testbin. Returns the shim
 // binary's absolute path, the bundle directory, and the rootfs

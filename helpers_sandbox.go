@@ -448,6 +448,31 @@ func readContainerOutput(tb testing.TB, env *sandboxEnv, cid, want string, timeo
 	}
 }
 
+// containerOutputSnapshot returns whatever stdout has been captured so
+// far for cid, with no waiting for particular content — unlike
+// readContainerOutput, which blocks for a specific substring. Use this
+// when the expected output isn't known in advance (e.g. it's the value
+// under test, not a fixed marker) and the container's completion is
+// already known some other way (typically a prior Task.Wait).
+//
+// Callers should allow a brief moment after Task.Wait returns before
+// calling this: the container's process has exited, but the FIFO
+// drain goroutine may not have flushed the last of its output quite
+// yet (see the same allowance in execInSandboxContainer).
+func containerOutputSnapshot(tb testing.TB, env *sandboxEnv, cid string) string {
+	tb.Helper()
+	env.mu.Lock()
+	co := env.stdoutBufs[cid]
+	env.mu.Unlock()
+	if co == nil {
+		tb.Fatalf("no captured stdout for container %s", cid)
+		return ""
+	}
+	co.mu.Lock()
+	defer co.mu.Unlock()
+	return co.buf.String()
+}
+
 // writeContainerStdin writes data to the stdin FIFO of a member container
 // created with withSandboxCtrStdin, then closes the write end and signals
 // EOF via the CloseIO RPC. The container must have been created via

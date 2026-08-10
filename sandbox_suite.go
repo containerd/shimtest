@@ -114,6 +114,8 @@ func (s *SandboxSuite) Run(t *testing.T) {
 	t.Run("MemberContainersShareDevShm", s.testMemberContainersShareDevShm)
 	t.Run("MemberContainersDevShmNotSharedWithoutIPC", s.testMemberContainersDevShmNotSharedWithoutIPC)
 	t.Run("MemberContainerOOMIsolation", s.testMemberContainerOOMIsolation)
+	t.Run("MemberContainersShareUTS", s.testMemberContainersShareUTS)
+	t.Run("MemberContainersUTSNotShared", s.testMemberContainersUTSNotShared)
 }
 
 // testLifecycle drives the sandbox through the full lifecycle:
