@@ -30,9 +30,12 @@ jobs:
           go-version: "1.26.x"
 
       - name: Install system dependencies
+        # slirp4netns provides the container networking the "net" test
+        # suite sets up itself (see attachContainerNetwork); it is not
+        # something the shim under test is expected to supply.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libseccomp-dev
+          sudo apt-get install -y libseccomp-dev slirp4netns
 
       - name: Build containerd shim
         # The shimtest harness does not require a containerd daemon;

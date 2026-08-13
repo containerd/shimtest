@@ -20,6 +20,9 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,7 +31,19 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/ttrpc"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
+
+// networkSuiteInboundPort is the fixed TCP port testInboundTCPListen's
+// container binds and the host dials, when Config.ProvideNetwork is set.
+// A fixed port (rather than one discovered from the container's stdout
+// at runtime) lets the test register the slirp4netns inbound forward
+// before Task.Start, before the container's listener even exists, so
+// there is no window in which an early connection attempt could race
+// the forward's registration. This suite's tests run sequentially
+// (never in parallel with each other), so a single fixed port across
+// runs cannot collide with itself.
+const networkSuiteInboundPort = 39117
 
 // NetworkSuite contains conformance tests for a container's default
 // network connectivity, gated on the "net" feature.
@@ -62,6 +77,43 @@ func (s *NetworkSuite) Run(t *testing.T) {
 	t.Run("LoopbackWithinContainer", s.testLoopbackWithinContainer)
 }
 
+// containerHostAddr returns the address a member of this suite's
+// containers should use to reach a host-bound listener: slirpHostAddr
+// when the test itself is providing the container's networking (see
+// attachContainerNetwork), or the host's own loopback when the shim is
+// assumed to already give the container a working default network path
+// (e.g. by sharing the host's network namespace).
+func (s *NetworkSuite) containerHostAddr() string {
+	if s.cfg.ProvideNetwork {
+		return slirpHostAddr
+	}
+	return "127.0.0.1"
+}
+
+// networkSpecOpts returns the CreateOCISpec opts needed for a
+// container to get its own network namespace, when this suite is
+// responsible for providing that container's networking itself
+// (Config.ProvideNetwork). Returns nil otherwise: the shim is assumed
+// to already provide a default network path with no special spec
+// configuration required.
+func (s *NetworkSuite) networkSpecOpts() []func(*specs.Spec) {
+	if !s.cfg.ProvideNetwork {
+		return nil
+	}
+	return []func(*specs.Spec){withNewNetworkNamespace()}
+}
+
+// attachIfProvided attaches this suite's own container networking (see
+// attachContainerNetwork) after Task.Create when Config.ProvideNetwork
+// is set, and is a no-op otherwise.
+func (s *NetworkSuite) attachIfProvided(t *testing.T, pid uint32) *containerNetwork {
+	t.Helper()
+	if !s.cfg.ProvideNetwork {
+		return nil
+	}
+	return attachContainerNetwork(t, pid)
+}
+
 // testOutboundTCP verifies that a container's init process can open an
 // outbound TCP connection to a host-reachable endpoint and complete a
 // round trip.
@@ -75,6 +127,13 @@ func (s *NetworkSuite) Run(t *testing.T) {
 // stdin to the connection and the connection to stdout. The test writes a
 // token to the container's stdin FIFO; the host echoes it back; the test
 // asserts that the container's stdout contains the echoed token.
+//
+// When Config.ProvideNetwork is set, connectivity is provided by the test
+// itself (see attachContainerNetwork): the container reaches the host at
+// slirpHostAddr, which slirp4netns proxies to the host's own 127.0.0.1,
+// exactly where the listener below is bound. Otherwise the shim is assumed
+// to already give the container a default network path reaching the host
+// directly at 127.0.0.1.
 func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	cid := containerID(t)
@@ -85,7 +144,7 @@ func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	host, port, err := net.SplitHostPort(ln.Addr().String())
+	_, port, err := net.SplitHostPort(ln.Addr().String())
 	if err != nil {
 		t.Fatalf("split addr: %v", err)
 	}
@@ -121,7 +180,7 @@ func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 	}()
 
 	// nc <host> <port>: TCP mode, bidirectional pipe between socket and stdio.
-	createOCISpec(t, bundleDir, []string{"/bin/nc", host, port}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/nc", s.containerHostAddr(), port}, s.cfg, s.networkSpecOpts()...)
 
 	stdinPath, stdoutPath, stderrPath := createStdioFifos(t, bundleDir)
 	ns := uniqueTestNamespace(t, "net")
@@ -150,9 +209,15 @@ func (s *NetworkSuite) testOutboundTCP(t *testing.T) {
 		t.Fatalf("open stdin fifo: %v", err)
 	}
 
-	if _, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	createResp, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts))
+	if err != nil {
 		t.Fatal("create failed:", err)
 	}
+	// Attach networking (when we're responsible for providing it) after
+	// Create (so the container's network namespace already exists) and
+	// before Start (so nc's very first connect() sees a fully configured
+	// network) — see attachContainerNetwork.
+	s.attachIfProvided(t, createResp.GetPid())
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
 	}
@@ -223,7 +288,7 @@ func (s *NetworkSuite) testOutboundUDP(t *testing.T) {
 	}
 	t.Cleanup(func() { pc.Close() })
 
-	host, port, err := net.SplitHostPort(pc.LocalAddr().String())
+	_, port, err := net.SplitHostPort(pc.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("split addr: %v", err)
 	}
@@ -250,8 +315,9 @@ func (s *NetworkSuite) testOutboundUDP(t *testing.T) {
 		recvDone <- nil
 	}()
 
-	// nc -u <host> <port>: UDP mode, one sendto (stdin) then one recvfrom (stdout).
-	createOCISpec(t, bundleDir, []string{"/bin/nc", "-u", host, port}, s.cfg)
+	// nc -u <host> <port>: UDP mode, one sendto (stdin) then one recvfrom
+	// (stdout). See testOutboundTCP for containerHostAddr/networkSpecOpts.
+	createOCISpec(t, bundleDir, []string{"/bin/nc", "-u", s.containerHostAddr(), port}, s.cfg, s.networkSpecOpts()...)
 
 	stdinPath, stdoutPath, stderrPath := createStdioFifos(t, bundleDir)
 	ns := uniqueTestNamespace(t, "net")
@@ -277,9 +343,11 @@ func (s *NetworkSuite) testOutboundUDP(t *testing.T) {
 		t.Fatalf("open stdin fifo: %v", err)
 	}
 
-	if _, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	createResp, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts))
+	if err != nil {
 		t.Fatal("create failed:", err)
 	}
+	s.attachIfProvided(t, createResp.GetPid())
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
 	}
@@ -346,12 +414,37 @@ const dnsTestHostname = "example.com"
 // The container runs host(1) (host <name>), which prints one line per address
 // in the form "<name> has address <ip>". The test parses those lines and
 // validates that each address field is a valid IP address.
+//
+// When Config.ProvideNetwork is set, connectivity is provided by the test
+// itself (see attachContainerNetwork), whose resolver is slirpDNSAddr; the
+// container's /etc/resolv.conf is bind-mounted to point at it, since the
+// embedded rootfs carries none of its own. Otherwise the shim is assumed to
+// already give the container a default network path with working DNS.
 func (s *NetworkSuite) testDNSResolve(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	cid := containerID(t)
 
+	specOpts := s.networkSpecOpts()
+	if s.cfg.ProvideNetwork {
+		resolvConfPath := filepath.Join(t.TempDir(), "resolv.conf")
+		if err := os.WriteFile(resolvConfPath, []byte("nameserver "+slirpDNSAddr+"\n"), 0o644); err != nil {
+			t.Fatalf("write resolv.conf: %v", err)
+		}
+		specOpts = append(specOpts, withExtraMounts(specs.Mount{
+			Type:        "bind",
+			Source:      resolvConfPath,
+			Destination: "/etc/resolv.conf",
+			// Not "ro": a read-only bind mount requires a follow-up
+			// MS_REMOUNT|MS_RDONLY, which fails EPERM in a rootless
+			// user namespace. Read-write is an acceptable tradeoff here
+			// -- this file is test-owned scratch data, not a security
+			// boundary the container has any reason to tamper with.
+			Options: []string{"rbind"},
+		}))
+	}
+
 	// host <name>: prints "<name> has address <ip>" for each resolved address.
-	createOCISpec(t, bundleDir, []string{"/bin/host", dnsTestHostname}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/host", dnsTestHostname}, s.cfg, specOpts...)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
 	ns := uniqueTestNamespace(t, "net")
@@ -371,9 +464,11 @@ func (s *NetworkSuite) testDNSResolve(t *testing.T) {
 	var stderrMu sync.Mutex
 	drainFifoInto(t, ctx, stderrPath, &stderrBuf, &stderrMu)
 
-	if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	createResp, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts))
+	if err != nil {
 		t.Fatal("create failed:", err)
 	}
+	s.attachIfProvided(t, createResp.GetPid())
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
 	}
@@ -434,21 +529,40 @@ func (s *NetworkSuite) testDNSResolve(t *testing.T) {
 // documentation claims that "ports bound inside the VM are transparently
 // mapped on the host"; this test verifies that claim is true in practice.
 //
-// The container runs nc(1) in verbose listen mode (nc -v -l 0, ephemeral
-// port). nc reports the socket it bound on stderr before accepting; the test
-// reads the port from there and dials host-loopback (127.0.0.1:<port>), sends
-// a token, and asserts the container echoes it back. The test hard-fails if
-// the host cannot connect: inbound reachability is a required contract of the
-// default networking path.
+// Without Config.ProvideNetwork, the container binds an ephemeral port (nc
+// -v -l 0) and the test discovers it from the container's stderr, assuming
+// the shim maps whatever port the container chose (e.g. "ports bound inside
+// the VM are transparently mapped on the host", as one shim's documentation
+// claims — this test verifies that claim in practice). With
+// Config.ProvideNetwork, the container instead binds the fixed
+// networkSuiteInboundPort, so the test can register its own inbound port
+// forward (see attachContainerNetwork.AddInboundForward) before Task.Start,
+// before the container's listener even exists.
+//
+// Either way nc -v reports the socket it bound on stderr before accepting;
+// the test waits for that line (as a pure readiness signal when the port is
+// already fixed and known) before dialing host-loopback (127.0.0.1:<port>)
+// and sending a token. nc copies its connection to stdout and its stdin to
+// the connection, but has no path that echoes received data back over the
+// same connection — so the test confirms the token actually reached the
+// container, which is this test's whole point, by waiting for it to appear
+// in the container's own captured stdout rather than by reading a reply off
+// the socket. The test hard-fails if the host cannot connect: inbound
+// reachability is a required contract of the default networking path.
 func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	cid := containerID(t)
 
-	// nc -v -l 0: bind an ephemeral port, report it on stderr, accept one
+	requestedPort := "0"
+	if s.cfg.ProvideNetwork {
+		requestedPort = strconv.Itoa(networkSuiteInboundPort)
+	}
+
+	// nc -v -l <port>: bind, report the bound socket on stderr, accept one
 	// connection, then bidirectionally pipe stdio↔socket. stdout is left
 	// carrying connection payload only, so the token assertion below cannot
 	// be confused by control output.
-	createOCISpec(t, bundleDir, []string{"/bin/nc", "-v", "-l", "0"}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/nc", "-v", "-l", requestedPort}, s.cfg, s.networkSpecOpts()...)
 
 	stdinPath, stdoutPath, stderrPath := createStdioFifos(t, bundleDir)
 	ns := uniqueTestNamespace(t, "net")
@@ -459,7 +573,7 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	client := ttrpc.NewClient(shimConn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
@@ -468,8 +582,17 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	var stderrMu sync.Mutex
 	drainFifoInto(t, ctx, stderrPath, &stderrBuf, &stderrMu)
 
-	if _, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	createResp, err := tc.Create(ctx, newCreateTaskRequestStdin(t, cid, bundleDir, stdinPath, stdoutPath, stderrPath, rootfsMounts))
+	if err != nil {
 		t.Fatal("create failed:", err)
+	}
+	netw := s.attachIfProvided(t, createResp.GetPid())
+	if s.cfg.ProvideNetwork {
+		// Register the forward before Start: the port is fixed and known
+		// ahead of time, so there is no need to wait for the container to
+		// report it first, and no window in which an early host
+		// connection attempt could race the forward's registration.
+		netw.AddInboundForward(t, networkSuiteInboundPort, networkSuiteInboundPort)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
@@ -478,14 +601,20 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	// Read the bound port from the container's stderr. nc -v reports the
 	// listening socket there before calling Accept, so this completes as
 	// soon as the listener is ready. A 15 s timeout guards against hangs.
+	// With Config.ProvideNetwork the port is already known and this only
+	// serves as a readiness signal; otherwise it's how the test learns
+	// the ephemeral port the shim mapped.
 	boundPort := waitForListeningPort(t, &stderrBuf, &stderrMu, 15*time.Second)
-	if _, err := net.LookupPort("tcp", boundPort); err != nil {
+	if s.cfg.ProvideNetwork {
+		if want := strconv.Itoa(networkSuiteInboundPort); boundPort != want {
+			t.Fatalf("container reported port %q, want %q", boundPort, want)
+		}
+	} else if _, err := net.LookupPort("tcp", boundPort); err != nil {
 		t.Fatalf("container reported non-numeric port %q: %v", boundPort, err)
 	}
 	t.Logf("container listener bound on port %s", boundPort)
 
-	// Dial the container's mapped port on the host loopback. Under TSI the
-	// guest-bound port is exposed at the same port number on the host.
+	// Dial the container's mapped/forwarded port on the host loopback.
 	hostAddr := net.JoinHostPort("127.0.0.1", boundPort)
 	const token = "network-suite-inbound-ok"
 
@@ -496,21 +625,32 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	}
 	hostConn.SetDeadline(time.Now().Add(10 * time.Second))
 
-	// Send the token to the container and read the echo.
+	// Send the token to the container.
 	if _, err := fmt.Fprintf(hostConn, "%s\n", token); err != nil {
 		t.Fatalf("host write to container: %v", err)
 	}
-	buf := make([]byte, 256)
-	n, err := hostConn.Read(buf)
-	if n == 0 && err != nil {
-		t.Fatalf("host read from container: %v", err)
+
+	// Confirm the token actually reached the container by waiting for it
+	// to show up in the container's own stdout, rather than reading a
+	// reply back over the socket (nc -l has no echo direction — see
+	// above).
+	tokenDeadline := time.After(10 * time.Second)
+	var out string
+	for {
+		stdoutMu.Lock()
+		out = stdoutBuf.String()
+		stdoutMu.Unlock()
+		if strings.Contains(out, token) {
+			break
+		}
+		select {
+		case <-tokenDeadline:
+			t.Fatalf("container did not report receiving %q within 10s; stdout so far: %q", token, out)
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
-	got := strings.TrimSpace(string(buf[:n]))
-	if got != token {
-		t.Errorf("inbound echo: got %q, want %q", got, token)
-	}
-	// Close the host connection so nc's io.Copy from stdin returns and the
-	// container process exits, allowing tc.Wait to complete.
+
+	// Close the host connection so nc's io.Copy from the connection returns.
 	hostConn.Close()
 
 	// Write nothing to stdin — just close it so nc's stdin→socket copy also
@@ -521,13 +661,19 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	}
 	stdinFifo.Close()
 
+	// Signal EOF to nc via the CloseIO RPC; see testOutboundTCP for why
+	// closing the test's own FIFO write end alone is not sufficient.
+	if _, err := tc.CloseIO(ctx, &taskAPI.CloseIORequest{ID: cid, Stdin: true}); err != nil {
+		t.Fatal("close stdin failed:", err)
+	}
+
 	waitResp, err := tc.Wait(ctx, &taskAPI.WaitRequest{ID: cid})
 	if err != nil {
 		t.Fatal("wait failed:", err)
 	}
 	<-stdoutDone
 	stdoutMu.Lock()
-	out := stdoutBuf.String()
+	out = stdoutBuf.String()
 	stdoutMu.Unlock()
 
 	if waitResp.ExitStatus != 0 {
@@ -536,7 +682,7 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 
 	tc.Delete(ctx, &taskAPI.DeleteRequest{ID: cid})
 	shutdownTask(ctx, tc, cid)
-	t.Logf("container inbound TCP listen: ok (port %s, echo %q)", boundPort, got)
+	t.Logf("container inbound TCP listen: ok (port %s)", boundPort)
 }
 
 // testLoopbackWithinContainer verifies that a container's init process can
@@ -556,6 +702,13 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 // process sequence (exec-chained via the shell), only in-container loopback
 // carries the traffic. The test uses a small helper binary ("looptest") that
 // chains the two calls; see cmdLooptest in testbin.
+//
+// This test doesn't need attachContainerNetwork's connectivity itself (it
+// never leaves the container), but when Config.ProvideNetwork is set it
+// still requests a network namespace and attaches to it like every other
+// test in this suite, to confirm that in-container loopback keeps working
+// under exactly the same namespace setup the tests that do need outside
+// connectivity depend on.
 func (s *NetworkSuite) testLoopbackWithinContainer(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	cid := containerID(t)
@@ -565,7 +718,7 @@ func (s *NetworkSuite) testLoopbackWithinContainer(t *testing.T) {
 	// looptest <token>: starts echosrv on an ephemeral port, waits for it to
 	// print the port, then connects to 127.0.0.1:<port>, sends the token, and
 	// prints the echoed response to stdout.
-	createOCISpec(t, bundleDir, []string{"/bin/looptest", token}, s.cfg)
+	createOCISpec(t, bundleDir, []string{"/bin/looptest", token}, s.cfg, s.networkSpecOpts()...)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
 	ns := uniqueTestNamespace(t, "net")
@@ -576,7 +729,7 @@ func (s *NetworkSuite) testLoopbackWithinContainer(t *testing.T) {
 	client := ttrpc.NewClient(shimConn)
 	defer client.Close()
 
-	tc := taskAPI.NewTTRPCTaskClient(client)
+	tc := newTaskClient(client, params.Version)
 
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
@@ -585,9 +738,11 @@ func (s *NetworkSuite) testLoopbackWithinContainer(t *testing.T) {
 	var stderrMu sync.Mutex
 	drainFifoInto(t, ctx, stderrPath, &stderrBuf, &stderrMu)
 
-	if _, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts)); err != nil {
+	createResp, err := tc.Create(ctx, newCreateTaskRequest(t, cid, bundleDir, stdoutPath, stderrPath, rootfsMounts))
+	if err != nil {
 		t.Fatal("create failed:", err)
 	}
+	s.attachIfProvided(t, createResp.GetPid())
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
 	}

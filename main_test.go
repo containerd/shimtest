@@ -61,10 +61,11 @@ type runConfig struct {
 // JSON aliases for the embedded Config fields. These match the
 // historical JSON profile schema (snake_case keys).
 type runConfigJSON struct {
-	ShimBinary   string            `json:"shim_binary"`
-	Env          map[string]string `json:"env,omitempty"`
-	FormatMounts bool              `json:"format_mounts,omitempty"`
-	Debug        bool              `json:"debug,omitempty"`
+	ShimBinary     string            `json:"shim_binary"`
+	Env            map[string]string `json:"env,omitempty"`
+	FormatMounts   bool              `json:"format_mounts,omitempty"`
+	Debug          bool              `json:"debug,omitempty"`
+	ProvideNetwork bool              `json:"provide_network,omitempty"`
 
 	Skip []string `json:"skip,omitempty"`
 	UID  *int     `json:"uid,omitempty"`
@@ -81,10 +82,11 @@ func (c *runConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	c.Config = shimtest.Config{
-		ShimBinary:   j.ShimBinary,
-		FormatMounts: j.FormatMounts,
-		Env:          j.Env,
-		Debug:        j.Debug,
+		ShimBinary:     j.ShimBinary,
+		FormatMounts:   j.FormatMounts,
+		Env:            j.Env,
+		Debug:          j.Debug,
+		ProvideNetwork: j.ProvideNetwork,
 	}
 	c.Skip = j.Skip
 	c.UID = j.UID
@@ -97,13 +99,14 @@ func (c *runConfig) UnmarshalJSON(data []byte) error {
 // the resolved config to a temp file the child reads).
 func (c runConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(runConfigJSON{
-		ShimBinary:   c.ShimBinary,
-		FormatMounts: c.FormatMounts,
-		Env:          c.Env,
-		Debug:        c.Debug,
-		Skip:         c.Skip,
-		UID:          c.UID,
-		GID:          c.GID,
+		ShimBinary:     c.ShimBinary,
+		FormatMounts:   c.FormatMounts,
+		Env:            c.Env,
+		Debug:          c.Debug,
+		ProvideNetwork: c.ProvideNetwork,
+		Skip:           c.Skip,
+		UID:            c.UID,
+		GID:            c.GID,
 	})
 }
 

@@ -583,6 +583,14 @@ func cmdNC(args []string) {
 			fmt.Fprintf(os.Stderr, "nc: udp send: %v\n", err)
 			os.Exit(1)
 		}
+		// A deadline here is deliberately not a retry: the caller (see
+		// attachContainerNetwork) is responsible for the container's
+		// network being fully ready before this process ever runs, so a
+		// reply that doesn't show up within the deadline is a real
+		// failure, not something to wait out. Its only job is to turn a
+		// missing reply into a fast, legible error instead of blocking
+		// forever.
+		pc.SetReadDeadline(time.Now().Add(10 * time.Second))
 		buf := make([]byte, 65536)
 		n, _, err := pc.ReadFrom(buf)
 		if err != nil {
