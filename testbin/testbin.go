@@ -86,6 +86,8 @@ func Main() {
 		cmdNC(args)
 	case "host":
 		cmdHost(args)
+	case "looptest":
+		cmdLooptest(args)
 	case "tickexit":
 		cmdTickexit(args)
 	default:
@@ -446,24 +448,62 @@ func cmdBurstexit(args []string) {
 	os.Exit(exitCode)
 }
 
-// cmdNC is a minimal netcat-compatible tool supporting three modes:
+// cmdNC is a minimal netcat-compatible tool supporting four modes:
 //
 //	nc -U <path>           connect to a unix domain socket
+//	nc [-v] -l <port>      listen on TCP (all IPv4 interfaces), accept one
+//	                       connection, then pipe stdio
 //	nc <host> <port>       connect via TCP
 //	nc -u <host> <port>    exchange a single UDP datagram
 //
-// In all modes data flows verbatim between the network endpoint and stdio,
-// matching the behaviour of the standard nc(1) utility:
-//   - TCP / unix: bidirectional io.Copy (stdin→socket, socket→stdout).
-//   - UDP: one unconnected sendto (stdin→remote) then one recvfrom
-//     (remote→stdout).  The socket is unconnected (ListenPacket / WriteTo /
-//     ReadFrom, i.e. sendto/recvfrom) so that shim networking layers cannot
-//     short-circuit routing based on the local connect(2) call, which for UDP
-//     always succeeds regardless of whether any peer is listening.
+// In stream modes (TCP / unix) data flows verbatim between the network
+// endpoint and stdio, matching the behaviour of the standard nc(1) utility:
+// stdout carries connection payload and nothing else.
+//
+// Listen mode (nc -l): binds tcp4 0.0.0.0:<port> (port 0 = ephemeral), then
+// accepts one connection and enters the same bidirectional stdio↔socket pipe
+// as connect mode. Listening is restricted to IPv4 (unlike connect mode,
+// which is dual-stack) to keep the address a peer must dial unambiguous.
+//
+// As with standard nc, the listening socket is reported only when -v is
+// given, and then on stderr -- never on stdout, which would corrupt the
+// payload stream. The line format matches nc -v exactly:
+//
+//	Listening on 0.0.0.0 39117
+//
+// It is written before the accept(2) call, so a caller that waits for it can
+// use it both to learn an ephemeral port and as a readiness signal. Note
+// that -v is honoured for listen mode only; standard nc is also verbose
+// about outgoing connections, which is not implemented here.
+//
+// In every stream mode nc terminates once *both* copy directions are done:
+// the peer has closed the connection *and* stdin has reached EOF. This
+// matches standard nc, which likewise keeps running after a peer close so
+// that a half-closed connection can still be written to. A caller driving nc
+// through a shim must therefore issue Task.CloseIO to signal stdin EOF;
+// closing its own write end of the stdin FIFO is not sufficient.
+//
+// UDP mode: one unconnected sendto (stdin→remote) then one recvfrom
+// (remote→stdout). The socket is unconnected (ListenPacket / WriteTo /
+// ReadFrom, i.e. sendto/recvfrom) so that shim networking layers cannot
+// short-circuit routing based on the local connect(2) call, which for UDP
+// always succeeds regardless of whether any peer is listening.
 func cmdNC(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: nc [-u] <host> <port> | nc -U <socket-path>")
+		fmt.Fprintln(os.Stderr, "usage: nc [-u] <host> <port> | nc [-v] -l <port> | nc -U <socket-path>")
 		os.Exit(1)
+	}
+
+	// Standard nc is silent unless -v is given. Strip it here so the mode
+	// dispatch below sees the same argument shape either way.
+	verbose := false
+	if args[1] == "-v" {
+		verbose = true
+		args = append([]string{args[0]}, args[2:]...)
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: nc [-v] -l <port>")
+			os.Exit(1)
+		}
 	}
 
 	switch args[1] {
@@ -476,6 +516,41 @@ func cmdNC(args []string) {
 		conn, err := net.Dial("unix", args[2])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "nc: %s: %v\n", args[2], err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+		ncStream(conn)
+
+	case "-l":
+		// Listen mode: nc [-v] -l <port>
+		// Binds tcp4 0.0.0.0:<port> (0 = ephemeral), accepts one connection,
+		// then bidirectionally pipes stdio↔socket. See the function comment
+		// for the -v listen notice and for the termination conditions.
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nc [-v] -l <port>")
+			os.Exit(1)
+		}
+		ln, err := net.Listen("tcp4", "0.0.0.0:"+args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nc: listen 0.0.0.0:%s: %v\n", args[2], err)
+			os.Exit(1)
+		}
+		if verbose {
+			// Report the socket actually bound, so a caller need not assume
+			// the kernel honoured the requested port. os.Stderr is
+			// unbuffered, so this reaches the caller before the accept(2)
+			// below and is therefore usable as a readiness signal.
+			host, boundPort, err := net.SplitHostPort(ln.Addr().String())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "nc: splithost: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Listening on %s %s\n", host, boundPort)
+		}
+		conn, err := ln.Accept()
+		ln.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nc: accept: %v\n", err)
 			os.Exit(1)
 		}
 		defer conn.Close()
@@ -576,5 +651,92 @@ func cmdHost(args []string) {
 	}
 	for _, a := range addrs {
 		fmt.Printf("%s has address %s\n", name, a)
+	}
+}
+
+// cmdLooptest verifies in-container loopback connectivity by starting an
+// ephemeral echo listener inside the same process, connecting to it over
+// 127.0.0.1, sending a token, and printing the echo to stdout.
+//
+// It is a self-contained in-process test that does not fork subprocesses: it
+// implements a minimal echo server directly, running it on a goroutine. This
+// avoids exec dependencies on the container's filesystem while keeping the
+// test agnostic to PID-namespace configuration.
+//
+// Usage: looptest <token>
+//
+// Exits 0 and prints the echoed token on success. Exits 1 with a diagnostic
+// on stderr if the listener, connection, or echo fails.
+func cmdLooptest(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: looptest <token>")
+		os.Exit(1)
+	}
+	token := args[1]
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "looptest: listen: %v\n", err)
+		os.Exit(1)
+	}
+	_, boundPort, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "looptest: splithost: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Run the echo server on a goroutine.
+	srvDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		ln.Close()
+		if err != nil {
+			srvDone <- fmt.Errorf("accept: %w", err)
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		n, rerr := conn.Read(buf)
+		if n == 0 && rerr != nil {
+			srvDone <- fmt.Errorf("read: %w", rerr)
+			return
+		}
+		if _, err := conn.Write(buf[:n]); err != nil {
+			srvDone <- fmt.Errorf("write: %w", err)
+			return
+		}
+		srvDone <- nil
+	}()
+
+	// Dial back over loopback.
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", boundPort), 10*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "looptest: dial 127.0.0.1:%s: %v\n", boundPort, err)
+		os.Exit(1)
+	}
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	if _, err := conn.Write([]byte(token)); err != nil {
+		fmt.Fprintf(os.Stderr, "looptest: write: %v\n", err)
+		os.Exit(1)
+	}
+
+	buf := make([]byte, 4096)
+	n, rerr := conn.Read(buf)
+	conn.Close()
+	if n == 0 && rerr != nil {
+		fmt.Fprintf(os.Stderr, "looptest: read echo: %v\n", rerr)
+		os.Exit(1)
+	}
+	got := string(buf[:n])
+	if got != token {
+		fmt.Fprintf(os.Stderr, "looptest: echo mismatch: got %q, want %q\n", got, token)
+		os.Exit(1)
+	}
+	fmt.Println(got)
+
+	if err := <-srvDone; err != nil {
+		fmt.Fprintf(os.Stderr, "looptest: server: %v\n", err)
+		os.Exit(1)
 	}
 }
