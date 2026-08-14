@@ -37,6 +37,16 @@ jobs:
       - name: Build containerd shim
         # The shimtest harness does not require a containerd daemon;
         # only the shim binary is needed.
+        env:
+          # setup-go pins GOTOOLCHAIN=local so the Go version installed
+          # above is used as-is. The containerd revision under test
+          # declares its own minimum Go version in go.mod, and the
+          # "main" matrix entry tracks containerd HEAD, so that minimum
+          # can advance independently of (and faster than) this repo's
+          # pinned go-version. Let the go command fetch whatever
+          # toolchain containerd's build requires instead of failing
+          # when it outpaces the runner's Go.
+          GOTOOLCHAIN: auto
         run: |
           git clone --depth=1 --branch "${{ matrix.containerd }}" \
             https://github.com/containerd/containerd.git /tmp/containerd
@@ -47,6 +57,10 @@ jobs:
 
       - name: Install runc
         # Use the runc version pinned by the containerd revision under test.
+        env:
+          # See the "Build containerd shim" step: runc's go.mod can also
+          # require a newer toolchain than the runner has installed.
+          GOTOOLCHAIN: auto
         run: |
           runc_version=$(cat /tmp/containerd/script/setup/runc-version)
           echo "runc version: ${runc_version}"
