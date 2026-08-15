@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -662,8 +663,30 @@ func cmdHost(args []string) {
 	}
 }
 
+// looptestPortRangeStart and looptestPortRangeEnd bound the candidates
+// cmdLooptest picks its listener's port from, instead of asking the guest
+// kernel for an ephemeral one (port 0). Some shims proxy each socket call
+// to the host independently of the others rather than truly sharing a
+// single network stack; under such a shim, a port-0 bind lets each side
+// independently pick "an ephemeral port," with no guarantee the two agree
+// -- the listener and the connector could each resolve to a different
+// number and never actually rendezvous. Binding a concrete port removes
+// that ambiguity: both ends of the same in-process test necessarily agree
+// on the number, because there is only one port to have picked. The range
+// is deliberately outside Linux's default ephemeral range (typically
+// 32768-60999), to reduce the chance of colliding with an unrelated
+// connection's OS-assigned source port. A short retry loop, rather than a
+// single fixed port, absorbs the (small, and this being an in-container
+// listener, more theoretical than practical) chance of a collision with
+// another process already using a given candidate.
+const (
+	looptestPortRangeStart = 20000
+	looptestPortRangeEnd   = 29999
+	looptestBindAttempts   = 20
+)
+
 // cmdLooptest verifies in-container loopback connectivity by starting an
-// ephemeral echo listener inside the same process, connecting to it over
+// echo listener inside the same process, connecting to it over
 // 127.0.0.1, sending a token, and printing the echo to stdout.
 //
 // It is a self-contained in-process test that does not fork subprocesses: it
@@ -682,9 +705,22 @@ func cmdLooptest(args []string) {
 	}
 	token := args[1]
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "looptest: listen: %v\n", err)
+	// See looptestPortRangeStart's doc for why this binds a concrete port
+	// from a fixed range, with a short retry loop, rather than port 0.
+	var ln net.Listener
+	var lastErr error
+	for range looptestBindAttempts {
+		port := looptestPortRangeStart + rand.IntN(looptestPortRangeEnd-looptestPortRangeStart+1)
+		l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ln = l
+		break
+	}
+	if ln == nil {
+		fmt.Fprintf(os.Stderr, "looptest: listen: %v\n", lastErr)
 		os.Exit(1)
 	}
 	_, boundPort, err := net.SplitHostPort(ln.Addr().String())

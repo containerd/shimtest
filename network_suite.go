@@ -19,6 +19,7 @@ package shimtest
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -34,16 +35,62 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// networkSuiteInboundPort is the fixed TCP port testInboundTCPListen's
-// container binds and the host dials, when Config.ProvideNetwork is set.
-// A fixed port (rather than one discovered from the container's stdout
-// at runtime) lets the test register the slirp4netns inbound forward
-// before Task.Start, before the container's listener even exists, so
-// there is no window in which an early connection attempt could race
-// the forward's registration. This suite's tests run sequentially
-// (never in parallel with each other), so a single fixed port across
-// runs cannot collide with itself.
-const networkSuiteInboundPort = 39117
+// networkSuitePortRangeStart and networkSuitePortRangeEnd bound the
+// candidates pickHostPort chooses testInboundTCPListen's port from.
+// The range is deliberately outside Linux's default ephemeral port
+// range (typically 32768-60999), to reduce the chance of a candidate
+// colliding with an unrelated connection's OS-assigned source port.
+const (
+	networkSuitePortRangeStart = 20000
+	networkSuitePortRangeEnd   = 29999
+	networkSuitePortAttempts   = 20
+)
+
+// pickHostPort returns a TCP port on 127.0.0.1 verified free at the
+// moment of the call, by binding and immediately releasing a listener.
+// testInboundTCPListen uses this instead of requesting port 0 (letting
+// the container's own kernel assign an ephemeral port), for two
+// reasons:
+//
+//   - With Config.ProvideNetwork, the host-side inbound forward must be
+//     registered before Task.Start -- before the container's listener
+//     even exists -- so the port cannot be discovered from the
+//     container at runtime; it has to be chosen ahead of time.
+//   - More fundamentally, some shims proxy each socket call to the host
+//     independently rather than truly sharing the host's network stack
+//     (see containerHostAddr's doc and testLoopbackWithinContainer).
+//     For such a shim, binding port 0 lets the guest and the host each
+//     resolve "an ephemeral port" on their own, and the two are not
+//     guaranteed to agree: the application only ever observes the
+//     guest's number, which need not be the port the host is actually
+//     listening on. Requesting the same concrete port on both sides
+//     removes that ambiguity entirely, regardless of the shim's
+//     networking mechanism.
+//
+// Binding a random port from a fixed range, with a retry on conflict,
+// rather than a single hardcoded constant, avoids the test failing
+// outright should that one port already be in use -- e.g. a concurrent
+// run of this suite on the same host. This is inherently racy (another
+// process could take the port between release and the container's own
+// bind), but is a reasonable, standard mitigation for a test suite;
+// this suite's tests run sequentially (never in parallel with each
+// other), so at least a prior iteration of this same suite cannot be
+// the collision.
+func pickHostPort(t *testing.T) int {
+	t.Helper()
+	for range networkSuitePortAttempts {
+		port := networkSuitePortRangeStart + rand.IntN(networkSuitePortRangeEnd-networkSuitePortRangeStart+1)
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		return port
+	}
+	t.Fatalf("pickHostPort: no free port in %d-%d after %d attempts",
+		networkSuitePortRangeStart, networkSuitePortRangeEnd, networkSuitePortAttempts)
+	return 0
+}
 
 // NetworkSuite contains conformance tests for a container's default
 // network connectivity, gated on the "net" feature.
@@ -529,22 +576,23 @@ func (s *NetworkSuite) testDNSResolve(t *testing.T) {
 // documentation claims that "ports bound inside the VM are transparently
 // mapped on the host"; this test verifies that claim is true in practice.
 //
-// Without Config.ProvideNetwork, the container binds an ephemeral port (nc
-// -v -l 0) and the test discovers it from the container's stderr, assuming
-// the shim maps whatever port the container chose (e.g. "ports bound inside
-// the VM are transparently mapped on the host", as one shim's documentation
-// claims — this test verifies that claim in practice). With
-// Config.ProvideNetwork, the container instead binds the fixed
-// networkSuiteInboundPort, so the test can register its own inbound port
-// forward (see attachContainerNetwork.AddInboundForward) before Task.Start,
-// before the container's listener even exists.
+// The container binds a concrete port chosen by pickHostPort — never port
+// 0 — regardless of Config.ProvideNetwork. See pickHostPort's doc for why
+// a discovered ephemeral port is not just unnecessary but actively unsafe
+// to rely on for some shims: the guest and the host can each resolve "an
+// ephemeral port" independently and disagree, so the application's own
+// report of its bound port is not guaranteed to be where the host is
+// actually listening. With Config.ProvideNetwork the fixed port is also
+// what lets the test register its own inbound port forward (see
+// attachContainerNetwork.AddInboundForward) before Task.Start, before the
+// container's listener even exists.
 //
-// Either way nc -v reports the socket it bound on stderr before accepting;
-// the test waits for that line (as a pure readiness signal when the port is
-// already fixed and known) before dialing host-loopback (127.0.0.1:<port>)
-// and sending a token. nc copies its connection to stdout and its stdin to
-// the connection, but has no path that echoes received data back over the
-// same connection — so the test confirms the token actually reached the
+// nc -v reports the socket it bound on stderr before accepting; the test
+// waits for that line purely as a readiness signal (the port itself is
+// already known) before dialing host-loopback (127.0.0.1:<port>) and
+// sending a token. nc copies its connection to stdout and its stdin to the
+// connection, but has no path that echoes received data back over the same
+// connection — so the test confirms the token actually reached the
 // container, which is this test's whole point, by waiting for it to appear
 // in the container's own captured stdout rather than by reading a reply off
 // the socket. The test hard-fails if the host cannot connect: inbound
@@ -553,10 +601,8 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	shimBin, bundleDir, rootfsMounts := shimSetup(t, s.cfg)
 	cid := containerID(t)
 
-	requestedPort := "0"
-	if s.cfg.ProvideNetwork {
-		requestedPort = strconv.Itoa(networkSuiteInboundPort)
-	}
+	port := pickHostPort(t)
+	requestedPort := strconv.Itoa(port)
 
 	// nc -v -l <port>: bind, report the bound socket on stderr, accept one
 	// connection, then bidirectionally pipe stdio↔socket. stdout is left
@@ -592,7 +638,7 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 		// ahead of time, so there is no need to wait for the container to
 		// report it first, and no window in which an early host
 		// connection attempt could race the forward's registration.
-		netw.AddInboundForward(t, networkSuiteInboundPort, networkSuiteInboundPort)
+		netw.AddInboundForward(t, port, port)
 	}
 	if _, err := tc.Start(ctx, &taskAPI.StartRequest{ID: cid}); err != nil {
 		t.Fatal("start failed:", err)
@@ -601,16 +647,12 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 	// Read the bound port from the container's stderr. nc -v reports the
 	// listening socket there before calling Accept, so this completes as
 	// soon as the listener is ready. A 15 s timeout guards against hangs.
-	// With Config.ProvideNetwork the port is already known and this only
-	// serves as a readiness signal; otherwise it's how the test learns
-	// the ephemeral port the shim mapped.
+	// The port is already known (see pickHostPort); this is a readiness
+	// signal, and doubles as a check that the container actually bound
+	// the exact port it was asked to.
 	boundPort := waitForListeningPort(t, &stderrBuf, &stderrMu, 15*time.Second)
-	if s.cfg.ProvideNetwork {
-		if want := strconv.Itoa(networkSuiteInboundPort); boundPort != want {
-			t.Fatalf("container reported port %q, want %q", boundPort, want)
-		}
-	} else if _, err := net.LookupPort("tcp", boundPort); err != nil {
-		t.Fatalf("container reported non-numeric port %q: %v", boundPort, err)
+	if boundPort != requestedPort {
+		t.Fatalf("container reported port %q, want %q", boundPort, requestedPort)
 	}
 	t.Logf("container listener bound on port %s", boundPort)
 
@@ -696,12 +738,15 @@ func (s *NetworkSuite) testInboundTCPListen(t *testing.T) {
 // localhost connectivity: if the loopback inside a single container is broken,
 // containers sharing a network namespace will also fail.
 //
-// The container runs echosrv(1) to bind an ephemeral port on 0.0.0.0 and
-// print it to stdout, then a second nc(1) inside the same init process to
-// connect back to 127.0.0.1:<port>. Because both run in the same init
-// process sequence (exec-chained via the shell), only in-container loopback
-// carries the traffic. The test uses a small helper binary ("looptest") that
-// chains the two calls; see cmdLooptest in testbin.
+// The container runs a small helper binary ("looptest"; see cmdLooptest in
+// testbin) that binds a listener, then connects back to it over
+// 127.0.0.1:<port> from within the same process. Because both ends run in
+// the same init process, only in-container loopback carries the traffic.
+// looptest binds a concrete port from a fixed range with a short retry
+// loop, rather than port 0, for the same reason pickHostPort exists on the
+// host side: some shims proxy each socket call to the host independently,
+// so a port 0 bind's two ends could each resolve "an ephemeral port" to a
+// different number and never actually rendezvous.
 //
 // This test doesn't need attachContainerNetwork's connectivity itself (it
 // never leaves the container), but when Config.ProvideNetwork is set it
@@ -715,9 +760,10 @@ func (s *NetworkSuite) testLoopbackWithinContainer(t *testing.T) {
 
 	const token = "network-suite-loopback-ok"
 
-	// looptest <token>: starts echosrv on an ephemeral port, waits for it to
-	// print the port, then connects to 127.0.0.1:<port>, sends the token, and
-	// prints the echoed response to stdout.
+	// looptest <token>: binds a listener on a concrete port (see
+	// looptestPortRangeStart in testbin), then connects back to it from
+	// within the same process, sends the token, and prints the echoed
+	// response to stdout.
 	createOCISpec(t, bundleDir, []string{"/bin/looptest", token}, s.cfg, s.networkSpecOpts()...)
 
 	stdoutPath, stderrPath := createIOFifos(t, bundleDir)
