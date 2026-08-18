@@ -216,6 +216,29 @@ func withMemoryLimit(bytes int64) func(*specs.Spec) {
 	}
 }
 
+// withNewNetworkNamespace returns a CreateOCISpec opt that ensures the
+// spec requests a fresh (unshared) network namespace, appending one if
+// none is already present. createOCISpec already adds one for rootless
+// containers as part of dropping privileges; this opt exists so a
+// caller can request the same isolation for a root container too,
+// where createOCISpec otherwise leaves the container in the host's own
+// network namespace. Tests that provide their own container networking
+// (see attachContainerNetwork) need this so the namespace they attach
+// to is exclusively the container's, root or not.
+func withNewNetworkNamespace() func(*specs.Spec) {
+	return func(s *specs.Spec) {
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
+		}
+		for _, ns := range s.Linux.Namespaces {
+			if ns.Type == specs.NetworkNamespace {
+				return
+			}
+		}
+		s.Linux.Namespaces = append(s.Linux.Namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+	}
+}
+
 // shimSetup resolves the shim binary, creates a bundle directory, and
 // builds rootfs mounts from the embedded testbin. Returns the shim
 // binary's absolute path, the bundle directory, and the rootfs

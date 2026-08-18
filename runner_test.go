@@ -57,6 +57,9 @@ func TestShim(t *testing.T) {
 			if !featureSkipped("layers") {
 				shimtest.NewLayersSuite(c).Run(t)
 			}
+			if !featureSkipped("net") {
+				shimtest.NewNetworkSuite(c).Run(t)
+			}
 			t.Run("Stress", shimtest.NewStressSuite(c, shimtest.StressOptions{
 				Transfer: !featureSkipped("transfer"),
 			}).Run)
