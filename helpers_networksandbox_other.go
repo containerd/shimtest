@@ -1,3 +1,5 @@
+//go:build !linux
+
 /*
    Copyright The containerd Authors.
 
@@ -14,15 +16,18 @@
    limitations under the License.
 */
 
-// Testbin is a minimal multicall binary for use inside shimtest
-// containers. It provides a small set of utilities needed by the
-// test suite, invoked either directly (testbin <cmd> [args...]) or
-// via symlink (e.g. /bin/cat -> /bin/testbin).
-//
-// Commands: forever, burstexit, cat, date, echo, echosrv, exit, hashverify,
-// host, layercheck, ls, memhog, nc, tickexit
-package main
+package shimtest
 
-import "github.com/containerd/shimtest/testbin"
+import "testing"
 
-func main() { testbin.Main() }
+// createNetworkSandbox is not available on non-Linux platforms.
+// Tests that call it are expected to guard with runtime.GOOS == "linux"
+// or be in a linux-only file; this stub satisfies the compiler on other
+// platforms.
+func createNetworkSandbox(tb testing.TB) string {
+	tb.Skip("createNetworkSandbox is Linux-only")
+	return ""
+}
+
+// networkSandboxIsOpen always returns false on non-Linux platforms.
+func networkSandboxIsOpen(_ string) bool { return false }

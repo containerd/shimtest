@@ -2,5 +2,5 @@
   "shim_binary": "containerd-shim-runc-v2",
   "uid": 0,
   "provide_network": true,
-  "skip": ["layers", "transfer", "uds"]
+  "skip": ["layers", "sandbox", "transfer", "uds"]
 }
