@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/core/streaming"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/ttrpc"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // shimEnv is the per-test shim environment. It wraps the shim's
@@ -60,14 +61,17 @@ type shimEnv struct {
 // "transfer") and is forwarded to uniqueTestNamespace so that the
 // containerd namespace used by this shim encodes the suite for
 // zombie-process attribution.
-func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config, suite string) *shimEnv {
+//
+// opts are applied to the OCI spec before the container is created, for
+// tests that need mounts or other spec changes beyond the defaults.
+func newShimEnv(tb testing.TB, baseCtx context.Context, cfg Config, suite string, opts ...func(*specs.Spec)) *shimEnv {
 	tb.Helper()
 
 	shimBin, bundleDir, rootfsMounts := shimSetup(tb, cfg)
 
 	cid := containerID(tb)
 
-	createOCISpec(tb, bundleDir, []string{"/bin/forever"}, cfg)
+	createOCISpec(tb, bundleDir, []string{"/bin/forever"}, cfg, opts...)
 
 	stdoutPath, stderrPath := createIOFifos(tb, bundleDir)
 
