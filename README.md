@@ -108,9 +108,13 @@ config, the tree is `TestShim/<config-name>/<test-name>`.
 | `BindMountRead` | exec | Bind-mount the same 64 MiB fixture from a host tempfile and verify+benchmark via the bind path |
 | `OOM` | oom | Run a memory hog under a 128MiB limit and verify the kernel OOM-kills it (exit 137) |
 | `HundredLayers` | layers | Build a rootfs with 100 stacked erofs layers — layer 1 seeds 99 files in `/base` and adds `/added/file_1`; layers 2..100 each add `/added/file_K` and white out `/base/base_{K-2}`. Verify all 100 added files are present and all 99 base files are gone. Only meaningful with `format_mounts=true` (the shim assembles the multi-layer overlay itself); skipped otherwise |
-| `TransferCopyTo` | transfer | Copy a file into a container |
-| `TransferCopyToAndFrom` | transfer | Copy a file in and back out |
-| `TransferExecVerify` | transfer | Copy a file in, verify via exec |
+| `TransferCopyTo` | transfer | Copy a file into a container. The destination is a mount destination, so the copy must reach the mounted filesystem, not the root filesystem beneath it |
+| `TransferCopyToAndFrom` | transfer | Copy a file in and back out; both directions must resolve to the filesystem the container sees at the destination |
+| `TransferExecVerify` | transfer | Copy a file in, verify via exec. Reading it back through the transfer service proves nothing, since a shim that reads and writes the same wrong location is self-consistent |
+| `TransferMountDestinationWrite` | transfer | Copy a file under a bind mount destination and verify it reaches the mount source, checked at the source rather than read back |
+| `TransferMountDestinationRead` | transfer | Copy a file out from under a bind mount destination. The file is seeded in the source before the container starts, so returning it requires resolving the destination to the mounted filesystem |
+| `TransferMountShadowsLowerContent` | transfer | Mount over a directory the root filesystem populates, then verify the transfer service can read and write the mount but not the file the mount hides |
+| `TransferAbsoluteSymlinkTarget` | transfer | Extract an archive holding a directory, a symlink naming it by absolute path, and a file whose path runs through the symlink. The target must resolve against the container's root, verified via exec and by reading back through the symlink |
 | `UDSRoundTrip` | uds | UDS socket forwarding round-trip |
 | `OutboundTCP` | net | A container's init process opens an outbound TCP connection to a host-reachable endpoint and completes a round trip. Implementation-neutral: does not assume any particular networking mechanism, only that a container has working default outbound TCP connectivity, as "host networking" would provide. |
 | `OutboundUDP` | net | A container's init process exchanges a UDP datagram with a host-reachable endpoint. Same neutrality as `OutboundTCP`, for the datagram path. |
