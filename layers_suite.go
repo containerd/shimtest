@@ -117,6 +117,7 @@ func (s *LayersSuite) testHundredLayers(t *testing.T) {
 	ns := uniqueTestNamespace(t, "layers")
 	ctx := namespaces.WithNamespace(t.Context(), ns)
 
+	startEventsRecorder(t, bundleDir)
 	params := startShim(t, shimBin, bundleDir, cid, ns, s.cfg)
 	conn := connectShim(t, params.Address)
 	client := ttrpc.NewClient(conn)
